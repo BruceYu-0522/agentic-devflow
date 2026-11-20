@@ -19,3 +19,4 @@ __pycache__/
 
 # Generated DevFlow execution workspaces
 devflow-runs/
+.vite/

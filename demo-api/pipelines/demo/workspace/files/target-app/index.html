@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Target Task App</title>
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    // 首帧前确定主题，避免闪白
+    (function () {
+      var saved = localStorage.getItem("task-theme");
+      var prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.dataset.theme = saved || (prefersDark ? "dark" : "light");
+    })();
+  </script>
+</head>
+<body>
+  <main class="task-shell">
+    <header class="task-header">
+      <div>
+        <p>Target App</p>
+        <h1>任务管理</h1>
+      </div>
+      <button id="themeToggle" class="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="切换暗色模式">
+        <span class="theme-toggle__thumb"></span>
+      </button>
+    </header>
+
+    <ul id="taskList" class="task-list"></ul>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

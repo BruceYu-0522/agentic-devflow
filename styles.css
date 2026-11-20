@@ -475,7 +475,8 @@ h1, h2, p { margin-top: 0; }
 }
 
 .wave-input textarea:focus ~ label span,
-.wave-input textarea:valid ~ label span {
+.wave-input textarea:valid ~ label span,
+.is-demo .wave-input label span {
   color: var(--accent-primary);
   transform: translateY(-24px);
 }
@@ -2063,3 +2064,16 @@ textarea:focus, input:focus {
     transform: rotate(90deg);
   }
 }
+
+/* ===== 在线演示 ===== */
+.demo-note {
+  display: flex; align-items: flex-start; gap: 10px;
+  margin-top: 16px; padding: 12px 14px; border-radius: 14px;
+  background: linear-gradient(90deg, rgba(74, 159, 216, 0.1), rgba(74, 159, 216, 0.03));
+  border: 1px solid rgba(74, 159, 216, 0.18);
+  font-size: 13px; line-height: 1.6; color: #55606e;
+}
+.demo-note__tag { flex: none; padding: 1px 9px; border-radius: 999px; background: #4a9fd8; color: #fff; font-size: 12px; font-weight: 600; }
+.is-demo #requirementInput { cursor: default; }
+.is-demo #templateSelector { opacity: .6; }
+.stream-chunk { white-space: pre-wrap; }
