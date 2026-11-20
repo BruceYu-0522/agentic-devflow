@@ -274,9 +274,9 @@ function renderStatsPanel() {
     ? (totalLatency / 1000).toFixed(1) + "s"
     : totalLatency + "ms";
   elements.obsSummary.innerHTML =
-    '<span class="obs-metric">⏱ 总耗时 <strong>' + latencyDisplay + '</strong></span>' +
-    '<span class="obs-metric">🔤 总 Token <strong>' + formatNumber(totalTokens) + '</strong></span>' +
-    '<span class="obs-metric">✅ 阶段 <strong>' + cards.length + '</strong></span>';
+    '<span class="obs-metric">总耗时 <strong>' + latencyDisplay + '</strong></span>' +
+    '<span class="obs-metric">Token <strong>' + formatNumber(totalTokens) + '</strong></span>' +
+    '<span class="obs-metric">阶段 <strong>' + cards.length + '</strong></span>';
 
   // Cards — sort by stage order
   var stageOrder = ["requirement", "design", "code", "test", "review", "delivery"];
@@ -291,8 +291,8 @@ function renderStatsPanel() {
     return (
       '<div class="obs-card">' +
         '<div class="obs-card-head">' +
-          '<span class="obs-card-stage ' + s.stageId + '">' + escapeHtml(s.stageName) + '</span>' +
-          '<span class="obs-card-model">' + escapeHtml(s.model) + '</span>' +
+          '<span class="obs-card-stage ' + s.stageId + '">' + artifactRenderer.escapeHtml(s.stageName) + '</span>' +
+          '<span class="obs-card-model">' + artifactRenderer.escapeHtml(s.model) + '</span>' +
         '</div>' +
         '<div class="obs-card-metrics">' +
           '<div class="obs-metric-item">' +
@@ -300,11 +300,11 @@ function renderStatsPanel() {
             '<span class="obs-metric-value">' + latencyStr + '</span>' +
           '</div>' +
           '<div class="obs-metric-item">' +
-            '<span class="obs-metric-label">Prompt Tokens</span>' +
+            '<span class="obs-metric-label">输入 Token</span>' +
             '<span class="obs-metric-value">' + formatNumber(s.promptTokens) + '</span>' +
           '</div>' +
           '<div class="obs-metric-item">' +
-            '<span class="obs-metric-label">Completion Tokens</span>' +
+            '<span class="obs-metric-label">输出 Token</span>' +
             '<span class="obs-metric-value">' + formatNumber(s.completionTokens) + '</span>' +
           '</div>' +
         '</div>' +
@@ -583,7 +583,7 @@ function renderPrototype() {
     '<div class="visual-plan-header">' +
       '<strong>低保真原型预览</strong>' +
       '<p>AI 产品经理根据需求分析自动生成的原型页面</p>' +
-      '<button class="ghost-button expand-preview-btn inline-expand-btn" type="button">⛶ 全屏</button>' +
+      '<button class="ghost-button expand-preview-btn inline-expand-btn" type="button">全屏查看</button>' +
     '</div>' +
     '<div class="product-preview-frame">' +
       '<iframe srcdoc="' + artifactRenderer.escapeHtml(reqArtifact.prototypeHtml).replace(/"/g, "&quot;") + '" sandbox="allow-scripts allow-same-origin allow-forms" title="需求原型预览"></iframe>' +
@@ -828,7 +828,7 @@ function renderProductPreviewInCodeStage() {
     '<div class="visual-plan-header">' +
       '<strong>产品预览</strong>' +
       '<p>当前生成的页面效果，不满意可在评审时打回修改</p>' +
-      '<button class="ghost-button expand-preview-btn inline-expand-btn" type="button">⛶ 全屏</button>' +
+      '<button class="ghost-button expand-preview-btn inline-expand-btn" type="button">全屏查看</button>' +
     '</div>' +
     '<div class="product-preview-frame">' +
       '<iframe src="' + previewUrl + '" sandbox="allow-scripts allow-same-origin allow-forms" title="产品预览"></iframe>' +
@@ -995,7 +995,8 @@ function renderWorkspace() {
         var icon = document.createElement("span");
         icon.className = "file-icon";
         var ext = name.split(".").pop().toLowerCase();
-        icon.textContent = ext === "md" ? "📄" : ext === "html" ? "🌐" : ext === "mmd" ? "📊" : "📁";
+        icon.textContent = ext.slice(0, 4).toUpperCase();
+        icon.dataset.ext = ext;
 
         var info = document.createElement("div");
         info.className = "file-info";

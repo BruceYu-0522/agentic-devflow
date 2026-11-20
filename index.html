@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DevFlow Engine</title>
-  <link rel="stylesheet" href="styles.css?v=soft-bento-17">
+  <link rel="stylesheet" href="styles.css?v=clean-4">
 </head>
 <body>
   <main class="app-shell" id="top">
@@ -23,16 +23,15 @@
     </header>
 
     <section class="input-card tile" id="runner" aria-labelledby="runnerTitle">
-      <h1 id="runnerTitle" class="input-title">输入需求，AI Agent 驱动完整研发流程</h1>
+      <p class="eyebrow">AI 研发流程引擎</p>
+      <h1 id="runnerTitle" class="input-title">一句需求进去，六个阶段走完</h1>
+      <p class="input-sub">需求分析、方案设计、代码生成、测试生成、代码评审、交付总结，每个阶段由专属 Agent 完成，关键节点由你拍板。</p>
       <form class="request-command" id="requestForm">
-        <div class="wave-input">
-  <textarea id="requirementInput" rows="1" required></textarea>
-  <label for="requirementInput"><span>请</span><span>输</span><span>入</span><span>您</span><span>的</span><span>需</span><span>求</span></label>
-</div>
-        <button class="glow-button" type="submit">
-  <div class="glow-button__border"></div>
-  <span class="glow-button__text">开始生成</span>
-</button>
+        <textarea id="requirementInput" rows="2" required placeholder="用一句话描述你要做的功能，例如：给任务列表加一个按截止日期排序"></textarea>
+        <button class="primary-button run-button" type="submit">
+          开始生成
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </button>
       </form>
 
       <div class="template-selector">
@@ -93,7 +92,7 @@
                   <strong id="prototypeTitle">低保真原型预览</strong>
                   <p id="prototypeDesc">AI 产品经理根据需求分析自动生成的原型页面</p>
                 </div>
-                <button class="ghost-button expand-preview-btn" id="prototypeExpandBtn" type="button" title="全屏预览">⛶ 全屏</button>
+                <button class="ghost-button expand-preview-btn" id="prototypeExpandBtn" type="button" title="全屏预览">全屏查看</button>
               </div>
               <div class="product-preview-frame" id="prototypeFrameWrap">
                 <iframe id="prototypeFrame" title="需求原型预览" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
@@ -149,6 +148,31 @@
       </div>
 
       <div class="main-right">
+        <section class="review-panel tile" id="review" aria-labelledby="reviewTitle">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">人工确认</p>
+              <h2 id="reviewTitle">这一步要不要继续？</h2>
+            </div>
+            <span class="mini-badge" id="reviewState">暂时不用确认</span>
+          </div>
+
+          <div class="review-empty" id="reviewEmpty">
+            <strong>现在不用你审批</strong>
+            <p>每个阶段产出后都会停下来等你确认，通过后才会进入下一环节。</p>
+          </div>
+
+          <div class="review-controls hidden" id="reviewControls">
+            <p class="review-tip">看完上面的产物后，选择是否让流程继续。打回会让系统带着你的原因重新生成这一阶段。</p>
+            <label for="rejectReason">如果要打回，写一句原因</label>
+            <textarea id="rejectReason" rows="3" placeholder="例如：缺少空状态处理"></textarea>
+            <div class="review-actions">
+              <button class="approve-button" id="approveButton" type="button">通过，继续下一步</button>
+              <button class="reject-button" id="rejectButton" type="button">打回，重新生成</button>
+            </div>
+          </div>
+        </section>
+
         <section class="live-output-terminal tile" id="liveOutput" aria-live="polite">
           <div class="section-heading">
             <div>
@@ -176,30 +200,7 @@
           <div class="obs-cards" id="obsCards"></div>
         </section>
 
-        <section class="review-panel tile" id="review" aria-labelledby="reviewTitle">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">人工确认</p>
-              <h2 id="reviewTitle">人工确认</h2>
-            </div>
-            <span class="mini-badge" id="reviewState">暂时不用确认</span>
-          </div>
 
-          <div class="review-empty" id="reviewEmpty">
-            <strong>现在不用你审批</strong>
-            <p>每个阶段产出后都会停下来等你确认，通过后才会进入下一环节。</p>
-          </div>
-
-          <div class="review-controls hidden" id="reviewControls">
-            <p class="review-tip">看完上面的产物后，选择是否让流程继续。打回会让系统带着你的原因重新生成这一阶段。</p>
-            <label for="rejectReason">如果要打回，写一句原因</label>
-            <textarea id="rejectReason" rows="3" placeholder="例如：缺少空状态处理"></textarea>
-            <div class="review-actions">
-              <button class="approve-button" id="approveButton" type="button">通过，继续下一步</button>
-              <button class="reject-button" id="rejectButton" type="button">打回，重新生成</button>
-            </div>
-          </div>
-        </section>
       </div>
     </div>
 
@@ -211,7 +212,7 @@
           <h2 id="productPreviewTitle">生成的页面效果</h2>
         </div>
         <div class="delivery-preview-actions">
-          <button class="ghost-button expand-preview-btn" id="productExpandBtn" type="button" title="全屏预览">⛶ 全屏</button>
+          <button class="ghost-button expand-preview-btn" id="productExpandBtn" type="button" title="全屏预览">全屏查看</button>
           <a class="secondary-button" id="productPreviewLink" href="#" target="_blank" rel="noreferrer">在新窗口打开</a>
         </div>
       </div>
