@@ -3,30 +3,39 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DevFlow Engine</title>
-  <link rel="stylesheet" href="styles.css?v=clean-4">
+  <title>DevFlow Engine · 终端控制台</title>
+  <link rel="stylesheet" href="styles.css?v=console-1">
 </head>
 <body>
   <main class="app-shell" id="top">
     <header class="app-header">
       <a class="brand" href="#top" aria-label="DevFlow Engine">
-        <span class="brand-mark">D</span>
+        <span class="brand-mark">▮</span>
         <span>
-          <strong>DevFlow Engine</strong>
-          <small>AI 研发流程助手</small>
+          <strong>DEVFLOW<span class="brand-accent">_</span>ENGINE</strong>
+          <small>AI 研发流程 · 终端控制台</small>
         </span>
       </a>
       <div class="header-actions">
         <span class="status-pill" id="pipelineStatus">未开始</span>
+        <button class="ghost-button" id="historyButton" type="button" title="查看历史运行">历史运行</button>
         <button class="ghost-button" id="resetButton" type="button">重置</button>
+        <div class="history-panel hidden" id="historyPanel" role="dialog" aria-label="历史运行">
+          <div class="history-panel-head">
+            <strong>历史运行</strong>
+            <button class="ghost-button history-close" id="historyClose" type="button" aria-label="关闭">✕</button>
+          </div>
+          <div class="history-list" id="historyList"></div>
+        </div>
       </div>
     </header>
 
     <section class="input-card tile" id="runner" aria-labelledby="runnerTitle">
-      <p class="eyebrow">AI 研发流程引擎</p>
-      <h1 id="runnerTitle" class="input-title">一句需求进去，六个阶段走完</h1>
+      <p class="eyebrow">AI 研发流程引擎 — 输入一条需求</p>
+      <h1 id="runnerTitle" class="input-title">一句需求进去，六个阶段走完<span class="title-caret">▌</span></h1>
       <p class="input-sub">需求分析、方案设计、代码生成、测试生成、代码评审、交付总结，每个阶段由专属 Agent 完成，关键节点由你拍板。</p>
       <form class="request-command" id="requestForm">
+        <span class="prompt-sign" aria-hidden="true">&gt;_</span>
         <textarea id="requirementInput" rows="2" required placeholder="用一句话描述你要做的功能，例如：给任务列表加一个按截止日期排序"></textarea>
         <button class="primary-button run-button" type="submit">
           开始生成
@@ -42,19 +51,21 @@
           <option value="refactor">重构（跳过需求分析）</option>
         </select>
       </div>
-
-
     </section>
 
     <section class="stage-row-card tile" aria-labelledby="stageTitle">
       <div class="flow-heading">
         <div>
-          <p class="eyebrow">流程总览</p>
+          <p class="eyebrow">流程总览 · PIPELINE</p>
           <h2 id="stageTitle">6 步研发流程</h2>
         </div>
-        <span class="mini-badge" id="stageCount">0 / 6</span>
+        <div class="flow-badges">
+          <span class="mini-badge review-count-badge hidden" id="reviewCountBadge"></span>
+          <span class="mini-badge" id="stageCount">0 / 6</span>
+        </div>
       </div>
       <ol class="stage-row" id="stageList"></ol>
+      <p class="pipeline-failure hidden" id="failureBanner"></p>
     </section>
 
     <div class="main-grid">
@@ -62,10 +73,20 @@
         <section class="artifact-panel tile" id="artifacts" aria-labelledby="artifactTitle">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">当前产物</p>
+              <p class="eyebrow">当前产物 · ARTIFACTS</p>
               <h2 id="artifactTitle">系统刚刚产出了什么</h2>
             </div>
             <span class="mini-badge" id="currentAgent">等待开始</span>
+          </div>
+
+          <!-- 审批置顶条：有待审批时常驻可见，通过 / 打回一点就到 -->
+          <div class="approval-bar hidden" id="approvalBar">
+            <span class="approval-bar__label"><strong id="approvalStageName"></strong> 等你拍板</span>
+            <input type="text" id="rejectReason" placeholder="打回原因（打回时必填）" autocomplete="off">
+            <div class="approval-bar__actions">
+              <button class="approve-button" id="approveButton" type="button">通过，继续</button>
+              <button class="reject-button" id="rejectButton" type="button">打回</button>
+            </div>
           </div>
 
           <div class="artifact-empty" id="artifactEmpty">
@@ -76,43 +97,12 @@
           <article class="artifact-card hidden" id="artifactCard">
             <div class="artifact-sections" id="artifactSections"></div>
           </article>
-
-          <!-- Hidden templates for stage-specific components -->
-          <div class="hidden">
-            <section id="prdMap" aria-label="PRD 图谱">
-              <div class="visual-plan-header">
-                <strong id="prdMapTitle">需求结构图</strong>
-                <p id="prdMapSummary"></p>
-              </div>
-              <div class="prd-map-flow" id="prdMapFlow"></div>
-            </section>
-            <section id="prototypePreview" aria-label="需求原型预览">
-              <div class="visual-plan-header">
-                <div>
-                  <strong id="prototypeTitle">低保真原型预览</strong>
-                  <p id="prototypeDesc">AI 产品经理根据需求分析自动生成的原型页面</p>
-                </div>
-                <button class="ghost-button expand-preview-btn" id="prototypeExpandBtn" type="button" title="全屏预览">全屏查看</button>
-              </div>
-              <div class="product-preview-frame" id="prototypeFrameWrap">
-                <iframe id="prototypeFrame" title="需求原型预览" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
-              </div>
-            </section>
-            <section id="visualPlan" aria-label="方案设计蓝图">
-              <div class="visual-plan-header">
-                <strong id="visualPlanTitle">方案蓝图</strong>
-                <p id="visualPlanSummary"></p>
-              </div>
-              <div class="blueprint-flow" id="blueprintFlow"></div>
-              <div class="blueprint-risks" id="blueprintRisks"></div>
-            </section>
-          </div>
         </section>
 
         <section class="workspace-panel tile" id="workspace" aria-labelledby="workspaceTitle">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">工作区</p>
+              <p class="eyebrow">工作区 · WORKSPACE</p>
               <h2 id="workspaceTitle">生成文件</h2>
             </div>
             <span class="mini-badge" id="workspaceFileCount">0 个文件</span>
@@ -151,35 +141,30 @@
         <section class="review-panel tile" id="review" aria-labelledby="reviewTitle">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">人工确认</p>
-              <h2 id="reviewTitle">这一步要不要继续？</h2>
+              <p class="eyebrow">审批记录 · REVIEWS</p>
+              <h2 id="reviewTitle">每次拍板都有记录</h2>
             </div>
-            <span class="mini-badge" id="reviewState">暂时不用确认</span>
+            <span class="mini-badge" id="reviewState">暂无待确认</span>
           </div>
 
-          <div class="review-empty" id="reviewEmpty">
-            <strong>现在不用你审批</strong>
-            <p>每个阶段产出后都会停下来等你确认，通过后才会进入下一环节。</p>
+          <div class="review-history-empty" id="reviewHistoryEmpty">
+            <strong>暂无审批记录</strong>
+            <p>通过或打回后，这里会记下时间、阶段和原因。</p>
           </div>
-
-          <div class="review-controls hidden" id="reviewControls">
-            <p class="review-tip">看完上面的产物后，选择是否让流程继续。打回会让系统带着你的原因重新生成这一阶段。</p>
-            <label for="rejectReason">如果要打回，写一句原因</label>
-            <textarea id="rejectReason" rows="3" placeholder="例如：缺少空状态处理"></textarea>
-            <div class="review-actions">
-              <button class="approve-button" id="approveButton" type="button">通过，继续下一步</button>
-              <button class="reject-button" id="rejectButton" type="button">打回，重新生成</button>
-            </div>
-          </div>
+          <ol class="review-history" id="reviewHistoryList"></ol>
         </section>
 
         <section class="live-output-terminal tile" id="liveOutput" aria-live="polite">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">实时输出</p>
+              <p class="eyebrow">实时输出 · STDOUT</p>
               <h2 id="liveOutputTitle">AI 正在工作…</h2>
             </div>
             <span class="mini-badge" id="liveOutputStage">等待中</span>
+          </div>
+          <div class="live-output-summary hidden" id="liveOutputSummary">
+            <span id="liveOutputSummaryText"></span>
+            <button class="ghost-button" id="liveOutputExpandBtn" type="button">展开查看</button>
           </div>
           <div class="live-output-stream" id="liveOutputStream">
             <div class="live-output-empty" id="liveOutputEmpty">
@@ -192,15 +177,13 @@
         <section class="obs-panel tile hidden" id="obsPanel" aria-labelledby="obsPanelTitle">
           <div class="section-heading">
             <div>
-              <p class="eyebrow">可观测性</p>
+              <p class="eyebrow">可观测性 · METRICS</p>
               <h2 id="obsPanelTitle">运行统计</h2>
             </div>
             <div class="obs-summary-row" id="obsSummary"></div>
           </div>
           <div class="obs-cards" id="obsCards"></div>
         </section>
-
-
       </div>
     </div>
 
@@ -208,7 +191,7 @@
     <section class="product-preview-section tile hidden" id="productPreviewSection" aria-labelledby="productPreviewTitle">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">产品预览</p>
+          <p class="eyebrow">产品预览 · PREVIEW</p>
           <h2 id="productPreviewTitle">生成的页面效果</h2>
         </div>
         <div class="delivery-preview-actions">
@@ -225,60 +208,40 @@
     <section class="delivery-package tile hidden" id="deliveryPackage" aria-labelledby="deliveryTitle">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">最终成果</p>
+          <p class="eyebrow">最终成果 · DELIVERY</p>
           <h2 id="deliveryTitle">交付包</h2>
         </div>
       </div>
       <div class="delivery-grid">
-        <article>
-          <span>产品变化</span>
-          <strong id="deliverySummaryTitle">等待生成</strong>
-          <p id="deliverySummaryText">流程完成后，这里会显示最终产品和交付说明。</p>
+        <article class="delivery-summary">
+          <span>交付总结</span>
+          <div class="delivery-summary-body markdown-document" id="deliverySummaryBody"></div>
         </article>
         <article>
-          <span>验收方式</span>
-          <strong id="deliveryValidationTitle">等待生成</strong>
-          <p id="deliveryValidationText">流程完成后，这里会显示怎么验证产品可用。</p>
+          <span>变更统计</span>
+          <div class="delivery-stats" id="deliveryStats"></div>
         </article>
         <article>
-          <span>变更文件</span>
+          <span>文件清单</span>
           <ul id="deliveryFiles"></ul>
         </article>
       </div>
     </section>
   </main>
 
-  <div class="hidden">
-    <div id="setupHint">
-      <span>⚡ 首次使用请先启动后端并配置 LLM API Key，详见 README.md</span>
-    </div>
-    <span id="nextStepTitle"></span>
-    <span id="nextStepHint"></span>
-    <div id="runMonitor">
-      <div id="runDot"></div>
-      <span id="runMonitorTitle"></span>
-      <span id="runMonitorDetail"></span>
-    </div>
-    <button id="stopButton" type="button">暂停</button>
-    <button id="autoRunButton" type="button">自动到确认点</button>
-    <textarea id="mrDraft" readonly></textarea>
-    <img id="pencilSketchImage" src="" alt="">
-    <a id="pencilSketchLink" href="#"></a>
-  </div>
-
   <div class="clarification-modal hidden" id="clarificationModal" role="dialog" aria-modal="true" aria-labelledby="clarificationTitle">
     <form class="clarification-dialog" id="clarificationForm">
       <div class="clarification-header">
-        <span>需求澄清 · <span id="clarificationProgress">1 / 4</span></span>
-        <strong id="clarificationTitle">先回答几个关键问题</strong>
-        <p id="clarificationSubtitle">一次只问一个问题，回答后进入下一题。</p>
+        <span>需求澄清 · <span id="clarificationProgress">1 / 2</span></span>
+        <strong id="clarificationTitle">需求有点含糊，先确认两点</strong>
+        <p id="clarificationSubtitle">一次只问一个问题，想到什么写什么；不想答就直接跳过生成。</p>
       </div>
       <div class="clarification-original">
         <span>原始需求</span>
         <p id="clarificationRequirement"></p>
       </div>
       <div class="clarification-step" id="clarificationStep">
-        <span id="clarificationStepLabel">目标用户</span>
+        <span id="clarificationStepLabel">给谁用</span>
         <strong id="clarificationStepQuestion"></strong>
         <small id="clarificationStepHint"></small>
         <textarea id="clarificationStepAnswer" rows="3"></textarea>
@@ -286,7 +249,8 @@
       <div class="clarification-dots" id="clarificationDots"></div>
       <div class="clarification-actions">
         <button class="ghost-button" id="clarificationCancel" type="button">先不生成</button>
-        <button class="secondary-button" id="clarificationRecommend" type="button">使用推荐回答</button>
+        <button class="ghost-button" id="clarificationSkip" type="button">跳过，直接生成</button>
+        <button class="secondary-button hidden" id="clarificationRecommend" type="button">使用推荐回答</button>
         <button class="ghost-button hidden" id="clarificationPrev" type="button">上一题</button>
         <button class="primary-button" id="clarificationNext" type="button">下一题</button>
       </div>
@@ -294,11 +258,11 @@
     </form>
   </div>
 
-  <script src="config.js?v=soft-bento-17"></script>
+  <script src="config.js?v=console-1"></script>
   <script src="demo-backend.js?v=demo-1"></script>
-  <script src="pipeline-core.js?v=soft-bento-17"></script>
-  <script src="clarification-flow.js?v=soft-bento-17"></script>
-  <script src="artifact-renderer.js?v=soft-bento-17"></script>
-  <script src="script.js?v=soft-bento-17"></script>
+  <script src="pipeline-core.js?v=console-1"></script>
+  <script src="clarification-flow.js?v=console-1"></script>
+  <script src="artifact-renderer.js?v=console-1"></script>
+  <script src="script.js?v=console-1"></script>
 </body>
 </html>

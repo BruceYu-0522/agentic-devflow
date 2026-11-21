@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -7,6 +8,10 @@ from backend.schemas import Pipeline
 
 # Store pipelines as JSON files alongside run workspaces
 RUNS_DIR = Path("devflow-runs")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class InMemoryPipelineStore:
@@ -28,11 +33,20 @@ class InMemoryPipelineStore:
             if f.exists():
                 try:
                     data = json.loads(f.read_text(encoding="utf-8"))
-                    self._pipelines[data["id"]] = Pipeline(**data)
+                    pipeline = Pipeline(**data)
+                    # A pipeline left in "running" means the previous process
+                    # died mid-run (restart / crash): recover it to "ready"
+                    # so it can be resumed instead of being stuck forever.
+                    if pipeline.status == "running":
+                        pipeline.status = "ready"
+                        if not pipeline.failureReason:
+                            pipeline.failureReason = "上次执行中断（服务重启），已恢复为可继续状态"
+                    self._pipelines[pipeline.id] = pipeline
                 except Exception:
                     pass
 
     def save(self, pipeline: Pipeline) -> Pipeline:
+        pipeline.updatedAt = _now_iso()
         self._pipelines[pipeline.id] = pipeline
         # Persist to disk
         try:
@@ -48,6 +62,14 @@ class InMemoryPipelineStore:
         if not pipeline:
             raise HTTPException(status_code=404, detail="Pipeline 不存在。请确认后端没有重启过，或重新提交需求。")
         return pipeline
+
+    def list_all(self) -> list[Pipeline]:
+        """All pipelines, most recently updated first (for recovery / review)."""
+        return sorted(
+            self._pipelines.values(),
+            key=lambda p: p.updatedAt or p.createdAt or "",
+            reverse=True,
+        )
 
     def clear(self) -> None:
         self._pipelines.clear()

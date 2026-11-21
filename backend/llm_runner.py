@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -9,6 +10,8 @@ from backend.schemas import Pipeline, Stage
 from backend.skills import read_skill
 
 
+# Default model routing. Override per stage with env vars, e.g.
+# DEVFLOW_MODEL_CODE=claude-sonnet-4-5-20250929 (defaults below are unchanged).
 MODEL_ROUTER = {
     "requirement": "deepseek-v4-flash",
     "design": "gpt-5.4",
@@ -17,6 +20,67 @@ MODEL_ROUTER = {
     "review": "claude-opus-4-7",
     "delivery": "deepseek-v4-flash",
 }
+
+
+def get_model_for_stage(stage_id: str) -> str:
+    """Model for a stage: DEVFLOW_MODEL_<STAGE> env override, else the default."""
+    override = os.getenv(f"DEVFLOW_MODEL_{stage_id.upper()}", "").strip()
+    if override:
+        return override
+    return MODEL_ROUTER.get(stage_id, "deepseek-v4-flash")
+
+
+# ── LLM error classification (g) ──
+
+class LLMError(Exception):
+    """An LLM call failure with a machine-readable kind.
+
+    kind == "config": bad key / bad address / bad request — retrying will not
+    help. kind == "transient": rate limit / 5xx / network — retryable.
+    kind == "unknown": anything else.
+    """
+
+    def __init__(self, message: str, kind: str = "unknown") -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+MAX_LLM_RETRIES = 3
+# Backoff seconds between retries: 1s, 2s, 4s.
+LLM_RETRY_BACKOFFS = (1, 2, 4)
+
+
+def _retry_sleep(seconds: float) -> None:
+    """Sleep between retries (separate helper so tests can stub it out)."""
+    time.sleep(seconds)
+
+
+def _classify_http_status(status_code: int) -> tuple[str, str]:
+    """Return (kind, human-readable message) for an HTTP error status."""
+    if status_code == 429:
+        return "transient", "限流（429）：模型服务限流，已重试 3 次仍失败，请稍后重试"
+    if status_code in (401, 403):
+        return "config", f"配置错误：API Key 无效或未授权（HTTP {status_code}），请检查 DEVFLOW_LLM_API_KEY"
+    if 500 <= status_code < 600:
+        return "transient", f"模型服务异常（HTTP {status_code}），已重试 3 次仍失败，请稍后重试"
+    return "config", f"配置错误：模型服务拒绝请求（HTTP {status_code}），请检查 DEVFLOW_LLM_BASE_URL 与模型名"
+
+
+# Last LLM error, for the engine to surface a distinct message instead of
+# the generic "请确认环境变量" hint. Reset on each call.
+_last_llm_error: str = ""
+_last_llm_error_kind: str = ""
+
+
+def get_last_llm_error() -> tuple[str, str]:
+    """Return (message, kind) of the most recent LLM failure, or ("", "")."""
+    return _last_llm_error, _last_llm_error_kind
+
+
+def _record_llm_error(message: str, kind: str) -> None:
+    global _last_llm_error, _last_llm_error_kind
+    _last_llm_error = message
+    _last_llm_error_kind = kind
 
 DEFAULT_BASE_URL = "https://api.lingyaai.cn"
 
@@ -97,7 +161,19 @@ STAGE_SYSTEM_PROMPTS = {
         "你是 DevFlow Engine 的代码评审 Agent。你的职责是多维度审查代码变更的质量。"
         "检查：正确性（是否符合需求）、安全性（是否有明显漏洞）、规范性（代码风格是否一致）。"
         "用中文输出，包含评审结论（建议交付/需要修改）、各项检查结果、风险列表、改进建议。"
-        "不要因为代码风格偏好而阻塞交付。"
+        "不要因为代码风格偏好而阻塞交付。\n\n"
+        "## 结构化结论（必须）\n"
+        "在报告末尾另起一段，只输出一个 JSON 代码块，作为机器可读的评审结论，"
+        "自动评审只认这个 JSON：\n"
+        "```json\n"
+        '{"verdict": "pass", "issues": []}\n'
+        "```\n"
+        "或驳回时：\n"
+        "```json\n"
+        '{"verdict": "reject", "issues": ["具体问题1", "具体问题2"]}\n'
+        "```\n"
+        "verdict 只能是 pass 或 reject；issues 是字符串数组，驳回时至少列出 1 条具体问题，"
+        "通过时为空数组。不要在 JSON 外再解释 verdict。"
     ),
     "delivery": (
         "你是 DevFlow Engine 的交付总结 Agent。你的职责是整合全部阶段产物，"
@@ -235,10 +311,13 @@ def build_messages(stage: Stage, pipeline: Pipeline) -> list[dict[str, str]]:
         "你是 DevFlow Engine 中的研发流程 Agent。请严格围绕当前阶段输出。",
     )
 
-    # Add skill as working specification if it differs from the system prompt
+    # Add skill as working specification if it differs from the system prompt.
+    # Full skill text: the output contract and quality gates live in the
+    # second half of the file, so truncating to 2000 chars silently dropped
+    # them (requirements-analysis.skill.md is ~7KB).
     if skill_text and len(skill_text) > 50:
         system_prompt += (
-            f"\n\n工作规范（Skill）：\n{skill_text[:2000]}"
+            f"\n\n工作规范（Skill）：\n{skill_text}"
         )
 
     return [
@@ -260,25 +339,47 @@ def build_messages(stage: Stage, pipeline: Pipeline) -> list[dict[str, str]]:
 
 def build_payload(stage: Stage, pipeline: Pipeline) -> dict[str, Any]:
     return {
-        "model": MODEL_ROUTER[stage.id],
+        "model": get_model_for_stage(stage.id),
         "messages": build_messages(stage, pipeline),
         "temperature": 0.3,
     }
 
 
 def post_chat_completion(payload: dict[str, Any], stage_id: str = "") -> dict[str, Any]:
+    """POST /v1/chat/completions with exponential-backoff retries.
+
+    Retries (up to 3, backoff 1s/2s/4s) only for retryable failures: HTTP 429,
+    HTTP 5xx, and network/timeout errors. Auth/config errors (401/403/4xx)
+    raise LLMError(kind="config") immediately without retrying. After the
+    retries are exhausted, raises LLMError(kind="transient").
+    """
     config = _resolve_provider_config(stage_id)
-    response = httpx.post(
-        f"{config['base_url']}/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {config['api_key']}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=300,
-    )
-    response.raise_for_status()
-    return response.json()
+    url = f"{config['base_url']}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json",
+    }
+    last_error: Exception | None = None
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=300)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            kind, message = _classify_http_status(status)
+            if kind != "transient":
+                raise LLMError(message, kind="config") from exc
+            last_error = LLMError(message, kind="transient")
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = LLMError(
+                f"网络问题：连接模型服务超时或失败（{exc.__class__.__name__}），已重试，请检查网络与 DEVFLOW_LLM_BASE_URL",
+                kind="transient",
+            )
+        if attempt < MAX_LLM_RETRIES:
+            _retry_sleep(LLM_RETRY_BACKOFFS[attempt])
+    assert last_error is not None
+    raise last_error
 
 
 def extract_content(response: dict[str, Any]) -> str:
@@ -293,7 +394,12 @@ def extract_content_and_usage(response: dict[str, Any]) -> tuple[str, dict, str]
 
 
 def _parse_response(response: dict[str, Any]) -> tuple[str, dict, str]:
-    """Parse LLM response into (content, usage_dict, reasoning_content)."""
+    """Parse LLM response into (content, usage_dict, reasoning_content).
+
+    Only ``content`` is ever returned as the body text. ``reasoning_content``
+    (the model's chain-of-thought) is returned separately for observability
+    and must never substitute for the body — it is not the deliverable.
+    """
     choices = response.get("choices") or []
     if not choices:
         return "", {}, ""
@@ -301,40 +407,38 @@ def _parse_response(response: dict[str, Any]) -> tuple[str, dict, str]:
     content = (message.get("content") or "").strip()
     reasoning = (message.get("reasoning_content") or "").strip()
     usage = response.get("usage") or {}
-
-    # Try each source: content, reasoning, preferring the one with parseable JSON
-    best = content  # default to content
-    for source in (content, reasoning):
-        if not source:
-            continue
-        if "{" in source or "```" in source:
-            best = source
-            break
-
-    # If neither has obvious structured output, pick the longer one
-    if best == content and len(reasoning) > len(content):
-        best = reasoning
-
-    return best, usage, reasoning
+    return content, usage, reasoning
 
 
 def run_llm_agent(stage: Stage, pipeline: Pipeline) -> tuple[str, str] | None:
-    """Run single LLM agent. Returns (content, model) for backward compat."""
+    """Run single LLM agent. Returns (content, model) for backward compat.
+
+    On failure returns None and records the classified error via
+    get_last_llm_error() so callers can tell a rate-limit/network failure
+    apart from a configuration error instead of guessing.
+    """
     if not llm_enabled():
+        _record_llm_error("LLM 未启用：请设置 DEVFLOW_LLM_ENABLED=true", "config")
         return None
 
     config = _resolve_provider_config(stage.id)
     if not config["api_key"]:
+        _record_llm_error("配置错误：未设置 DEVFLOW_LLM_API_KEY", "config")
         return None
 
     try:
         payload = build_payload(stage, pipeline)
         response = post_chat_completion(payload, stage.id)
         content, _usage, _reasoning = extract_content_and_usage(response)
-    except Exception:
+    except LLMError as exc:
+        _record_llm_error(str(exc), exc.kind)
+        return None
+    except Exception as exc:
+        _record_llm_error(f"LLM 调用失败：{exc}", "unknown")
         return None
 
     if not content:
+        _record_llm_error("LLM 返回了空内容", "unknown")
         return None
 
     return content, payload["model"]
@@ -343,20 +447,27 @@ def run_llm_agent(stage: Stage, pipeline: Pipeline) -> tuple[str, str] | None:
 def run_llm_agent_with_metrics(stage: Stage, pipeline: Pipeline) -> tuple[str, str, dict, str] | None:
     """Run single LLM agent with metrics. Returns (content, model, usage, reasoning)."""
     if not llm_enabled():
+        _record_llm_error("LLM 未启用：请设置 DEVFLOW_LLM_ENABLED=true", "config")
         return None
 
     config = _resolve_provider_config(stage.id)
     if not config["api_key"]:
+        _record_llm_error("配置错误：未设置 DEVFLOW_LLM_API_KEY", "config")
         return None
 
     try:
         payload = build_payload(stage, pipeline)
         response = post_chat_completion(payload, stage.id)
         content, usage, reasoning = extract_content_and_usage(response)
-    except Exception:
+    except LLMError as exc:
+        _record_llm_error(str(exc), exc.kind)
+        return None
+    except Exception as exc:
+        _record_llm_error(f"LLM 调用失败：{exc}", "unknown")
         return None
 
     if not content:
+        _record_llm_error("LLM 返回了空内容", "unknown")
         return None
 
     return content, payload["model"], usage, reasoning
@@ -519,7 +630,7 @@ async def stream_llm_agent(stage: Stage, pipeline: Pipeline) -> AsyncGenerator[s
         yield "event: fail\ndata: LLM API Key 未设置\n\n"
         return
 
-    model_name = MODEL_ROUTER.get(stage.id, "unknown")
+    model_name = get_model_for_stage(stage.id)
     provider_name = get_provider_name(stage.id)
     yield f"event: system\ndata: 正在调用 {model_name} 模型（{provider_name}）…\n\n"
     yield f"event: stage\ndata: {stage.name}\n\n"
@@ -756,7 +867,7 @@ async def stream_element_modification_llm(
         yield "event: fail\ndata: LLM API Key 未设置\n\n"
         return
 
-    model_name = MODEL_ROUTER.get("code", "deepseek-v4-flash")
+    model_name = get_model_for_stage("code")
     yield f"event: system\ndata: 正在调用 {model_name} 模型修改元素…\n\n"
 
     system_prompt = (

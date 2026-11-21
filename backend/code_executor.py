@@ -45,15 +45,32 @@ def summarize_diff(diff_text: str, max_lines: int = 80) -> str:
 
 
 def prepare_workspace(pipeline: Pipeline) -> Path:
-    if pipeline.projectPath:
-        return Path(pipeline.projectPath)
+    """Always return a sandbox copy under devflow-runs/<id>/target-app.
 
+    When projectPath is set, the real project is *copied* into the sandbox
+    first — patches are never written into the user's real directory.
+    Falls back to the bundled target-app template when projectPath is
+    missing or not a directory.
+    """
     RUNS_DIR.mkdir(exist_ok=True)
     workspace = RUNS_DIR / pipeline.id / "target-app"
     if workspace.exists():
         rmtree(workspace)
-    copytree(TARGET_APP, workspace)
+    source: Path | None = None
+    if pipeline.projectPath:
+        candidate = Path(pipeline.projectPath)
+        if candidate.is_dir():
+            source = candidate
+    if source is not None:
+        copytree(source, workspace, ignore=_copytree_ignore)
+    else:
+        copytree(TARGET_APP, workspace)
     return workspace
+
+
+def _copytree_ignore(path: str, names: list[str]) -> set[str]:
+    """Skip VCS / dependency / build noise when sandboxing a real project."""
+    return {n for n in names if n in SKIP_DIRS or n in {".git", ".venv", "venv"}}
 
 
 def read_project_files(workspace: Path) -> list[dict[str, str]]:
@@ -364,7 +381,7 @@ def apply_llm_code_patch(pipeline: Pipeline) -> CodeExecutionResult | None:
         print(f"[code-patch] {_last_code_error}")
         return None
 
-    model = llm_runner.MODEL_ROUTER["code"]
+    model = llm_runner.get_model_for_stage("code")
     print(f"[code-patch] Calling model {model}...")
     payload = {
         "model": model,
@@ -438,7 +455,7 @@ def apply_llm_code_patch(pipeline: Pipeline) -> CodeExecutionResult | None:
         content=result_content,
         changed_files=changed_files,
         workspace_path=str(workspace),
-        model=llm_runner.MODEL_ROUTER["code"],
+        model=llm_runner.get_model_for_stage("code"),
     )
 
 
@@ -468,7 +485,7 @@ def apply_llm_test_patch(pipeline: Pipeline) -> CodeExecutionResult | None:
         print("[test-patch] No project files found in workspace")
         return None
 
-    model = llm_runner.MODEL_ROUTER["test"]
+    model = llm_runner.get_model_for_stage("test")
     print(f"[test-patch] Calling model {model}...")
     payload = {
         "model": model,
@@ -547,5 +564,5 @@ def apply_llm_test_patch(pipeline: Pipeline) -> CodeExecutionResult | None:
         content=result_content,
         changed_files=changed_files,
         workspace_path=str(workspace),
-        model=llm_runner.MODEL_ROUTER["test"],
+        model=llm_runner.get_model_for_stage("test"),
     )

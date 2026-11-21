@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 import io
+import os
+import threading
 import zipfile
 
 from fastapi import FastAPI, HTTPException
@@ -40,18 +42,87 @@ app = FastAPI(
     version="0.2.0",
 )
 
+def _cors_origins() -> list[str]:
+    """Allowed CORS origins (f): configurable via DEVFLOW_CORS_ORIGINS
+    (comma-separated, "*" to allow all). Default is localhost origins only;
+    the Netlify deployment is same-origin so it needs no CORS entry."""
+    raw = os.getenv("DEVFLOW_CORS_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ── Per-pipeline run lock (c) ──
+# A set of pipeline ids currently executing a run, guarded by a plain
+# threading lock so it works for both sync endpoints (threadpool) and the
+# async SSE endpoint. A second run call on the same pipeline gets 409.
+_run_guard = threading.Lock()
+_running_pipelines: set[str] = set()
+
+
+def _try_acquire_run(pipeline_id: str) -> bool:
+    with _run_guard:
+        if pipeline_id in _running_pipelines:
+            return False
+        _running_pipelines.add(pipeline_id)
+        return True
+
+
+def _release_run(pipeline_id: str) -> None:
+    with _run_guard:
+        _running_pipelines.discard(pipeline_id)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/pipelines")
+def list_pipelines_endpoint() -> list[dict]:
+    """(b) List pipelines for recovery/review, most recently updated first.
+
+    Additive only: no existing endpoint's response shape is changed.
+    """
+    result = []
+    for p in store.list_all():
+        requirement = p.requirement or ""
+        result.append(
+            {
+                "id": p.id,
+                "name": requirement[:60],
+                "requirement": requirement,
+                "status": p.status,
+                "currentStageId": p.currentStageId,
+                "current_stage": p.currentStageId,
+                "updatedAt": p.updatedAt,
+                "updated_at": p.updatedAt,
+                "createdAt": p.createdAt,
+                "failureReason": p.failureReason,
+                "failure_reason": p.failureReason,
+                "failedStage": p.failedStage,
+                "failed_stage": p.failedStage,
+            }
+        )
+    return result
 
 
 @app.post("/pipelines", response_model=Pipeline)
@@ -67,25 +138,49 @@ def get_pipeline_endpoint(pipeline_id: str) -> Pipeline:
 @app.post("/pipelines/{pipeline_id}/run-next", response_model=Pipeline)
 def run_next_endpoint(pipeline_id: str) -> Pipeline:
     pipeline = store.get(pipeline_id)
-    return store.save(run_next_stage(pipeline))
+    if not _try_acquire_run(pipeline_id):
+        raise HTTPException(status_code=409, detail="该流水线正在运行中，请勿重复执行")
+    try:
+        return store.save(run_next_stage(pipeline))
+    except HTTPException:
+        # Persist the failed state (a) even though the call errors out.
+        store.save(pipeline)
+        raise
+    finally:
+        _release_run(pipeline_id)
 
 
 @app.post("/pipelines/{pipeline_id}/run-until-review", response_model=Pipeline)
 def run_until_review_endpoint(pipeline_id: str, auto: bool = False) -> Pipeline:
     pipeline = store.get(pipeline_id)
-    return store.save(run_until_review(pipeline, auto_mode=auto))
+    if not _try_acquire_run(pipeline_id):
+        raise HTTPException(status_code=409, detail="该流水线正在运行中，请勿重复执行")
+    try:
+        return store.save(run_until_review(pipeline, auto_mode=auto))
+    except HTTPException:
+        store.save(pipeline)
+        raise
+    finally:
+        _release_run(pipeline_id)
 
 
 @app.get("/pipelines/{pipeline_id}/stream-run")
 async def stream_run_endpoint(pipeline_id: str, auto: bool = False):
     """SSE endpoint that streams LLM output and system operations in real-time."""
     pipeline = store.get(pipeline_id)
+    if not _try_acquire_run(pipeline_id):
+        raise HTTPException(status_code=409, detail="该流水线正在运行中，请勿重复执行")
 
     async def event_stream():
-        async for event in run_until_review_with_stream(pipeline, auto_mode=auto):
-            yield event
-        # Save pipeline state after streaming
-        store.save(pipeline)
+        try:
+            async for event in run_until_review_with_stream(pipeline, auto_mode=auto):
+                # (c) Incremental persistence: save after every progress
+                # event so a disconnect can resume from GET /pipelines/{id}.
+                store.save(pipeline)
+                yield event
+        finally:
+            store.save(pipeline)
+            _release_run(pipeline_id)
 
     return StreamingResponse(
         event_stream(),
@@ -336,9 +431,11 @@ async def element_modify_stream_endpoint(
         )
 
     async def event_stream():
-        async for event in stream_element_modification(pipeline, info, change_request):
-            yield event
-        store.save(pipeline)
+        try:
+            async for event in stream_element_modification(pipeline, info, change_request):
+                yield event
+        finally:
+            store.save(pipeline)
 
     return StreamingResponse(
         event_stream(),

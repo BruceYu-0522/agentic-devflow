@@ -1,4 +1,4 @@
-﻿(function (root, factory) {
+(function (root, factory) {
   if (typeof module === "object" && module.exports) {
     module.exports = factory();
   } else {
@@ -16,52 +16,185 @@
     { id: "delivery", name: "交付总结", agent: "交付总结 Agent", approvalRequired: true },
   ];
 
+  // Five visually distinct stage states. The key rule: a stage that is
+  // waiting for human review must NEVER look "complete", even though it
+  // already has an artifact.
+  var STAGE_STATES = ["pending", "running", "waiting_review", "complete", "failed"];
+
+  var STAGE_STATE_LABELS = {
+    pending: "待处理",
+    running: "进行中",
+    waiting_review: "待你审批",
+    complete: "已完成",
+    failed: "失败",
+  };
+
   /**
-   * Build a rotating stage wheel. Items are positioned on a circle;
-   * the wheel rotates so the active stage sits at the top pointer.
-   *
-   * Returns { items, wheelRotation, radius, activeIndex }:
-   *   - items[i].angle  — degrees clockwise from top (0 = top, 60 = right, …)
-   *   - wheelRotation   — CSS deg to rotate the wheel so current stage is at top
-   *   - radius          — wheel radius in px
+   * Resolve the display state of one stage from the pipeline snapshot.
+   * @param {string} stageId
+   * @param {object|null} pipeline — { status, currentStageId, artifacts, failed_stage }
+   * @returns {"pending"|"running"|"waiting_review"|"complete"|"failed"}
    */
-  function createStageWheelItems(stages, currentStageId, completedStageIds) {
-    var safeStages = stages || [];
-    var completed = completedStageIds || new Set();
-    var count = Math.max(safeStages.length, 1);
-    var activeIndex = safeStages.findIndex(function (stage) {
-      return stage.id === currentStageId;
+  function resolveStageState(stageId, pipeline) {
+    if (!pipeline) return "pending";
+    var artifacts = pipeline.artifacts || {};
+    var hasArtifact = !!artifacts[stageId];
+    var isCurrent = pipeline.currentStageId === stageId;
+    var status = pipeline.status;
+
+    // A failed stage is failed, even if a partial artifact exists.
+    // The API serializes camelCase (failedStage); accept snake_case too.
+    var failedStageId = pipeline.failed_stage || pipeline.failedStage;
+    if (status === "failed" && (failedStageId === stageId || (isCurrent && !failedStageId))) {
+      return "failed";
+    }
+    // Waiting for review beats "has artifact": the artifact exists precisely
+    // because this stage produced something that needs a human decision.
+    if (status === "waiting_review" && isCurrent) return "waiting_review";
+    if (status === "running" && isCurrent) return "running";
+    if (hasArtifact) return "complete";
+    if (status === "completed") return "complete";
+    return "pending";
+  }
+
+  /**
+   * Extract a 3-line summary layer from an artifact's Markdown:
+   * key points, changed files and risks. Anything not found is left out
+   * (the UI falls back to the first lines).
+   * @param {string} markdown
+   * @returns {{ points: string[], files: string[], risks: string[] }}
+   */
+  function extractArtifactSummary(markdown) {
+    var text = String(markdown || "");
+    var lines = text.split("\n");
+
+    var points = [];
+    var files = [];
+    var risks = [];
+    var inCodeFence = false;
+    var inRiskSection = false;
+    var seenFiles = {};
+
+    function stripMd(line) {
+      return line
+        .replace(/^#{1,6}\s+/, "")
+        .replace(/^[-*]\s+/, "")
+        .replace(/^\d+[.)]\s+/, "")
+        .replace(/(\*\*|__|`)/g, "")
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+        .trim();
+    }
+
+    function addFile(path) {
+      if (!path || seenFiles[path] || files.length >= 8) return;
+      seenFiles[path] = true;
+      files.push(path);
+    }
+
+    var fileRe = /[\w./-]+\.(?:js|ts|tsx|jsx|html|css|json|md|py|vue)/g;
+
+    lines.forEach(function (rawLine) {
+      var line = rawLine.trim();
+      if (/^```/.test(line)) {
+        inCodeFence = !inCodeFence;
+        return;
+      }
+      if (inCodeFence || !line) return;
+
+      var heading = line.match(/^#{1,6}\s+(.*)$/);
+      if (heading) {
+        inRiskSection = /风险|注意|待确认|待澄清|问题|隐患|风险点/.test(heading[1]);
+        var headText = stripMd(heading[1]);
+        if (headText && points.length < 3 && !inRiskSection) points.push(headText);
+        return;
+      }
+
+      // File paths: backticked tokens and table cells / list items naming files.
+      var m;
+      fileRe.lastIndex = 0;
+      while ((m = fileRe.exec(line)) !== null) {
+        addFile(m[0]);
+      }
+
+      if (/^[-*]\s+/.test(line) || /^\d+[.)]\s+/.test(line)) {
+        var item = stripMd(line);
+        if (!item) return;
+        if (inRiskSection) {
+          if (risks.length < 4) risks.push(item);
+          return;
+        }
+        // Skip list items that are only a file path (they already went to files).
+        if (!/^[\w./-]+\.(?:js|ts|tsx|jsx|html|css|json|md|py|vue)/.test(item) && points.length < 3) {
+          points.push(item.length > 60 ? item.slice(0, 60) + "…" : item);
+        }
+        return;
+      }
+
+      // Plain paragraph lines are fallback points.
+      if (points.length < 3 && !inRiskSection && line.length > 4) {
+        var plain = stripMd(line);
+        if (plain && plain.length > 4) points.push(plain.length > 60 ? plain.slice(0, 60) + "…" : plain);
+      }
     });
-    if (activeIndex < 0) activeIndex = 0;
 
-    var segmentAngle = 360 / count;
-    var radius = 195;
-    var wheelRotation = -activeIndex * segmentAngle;
+    return { points: points.slice(0, 3), files: files, risks: risks };
+  }
 
-    var items = safeStages.map(function (stage, index) {
-      var angle = index * segmentAngle;
-      var state = completed.has(stage.id)
-        ? "complete"
-        : stage.id === currentStageId
-          ? "current"
-          : "pending";
+  /**
+   * Detect a structured review verdict in an artifact's Markdown:
+   * a fenced JSON block (or inline JSON object) with { verdict: "pass"|"reject", issues: [...] }.
+   * @param {string} markdown
+   * @returns {{ verdict: "pass"|"reject", issues: string[] } | null}
+   */
+  function parseReviewVerdict(markdown) {
+    var text = String(markdown || "");
 
-      return {
-        id: stage.id,
-        name: stage.name,
-        agent: stage.agent,
-        approvalRequired: stage.approvalRequired,
-        angle: Math.round(angle),
-        state: state,
-      };
-    });
+    function normalize(obj) {
+      if (!obj || (obj.verdict !== "pass" && obj.verdict !== "reject")) return null;
+      var issues = [];
+      if (Array.isArray(obj.issues)) {
+        obj.issues.forEach(function (issue) {
+          if (typeof issue === "string") {
+            issues.push(issue);
+          } else if (issue && typeof issue === "object") {
+            issues.push(String(issue.title || issue.description || issue.message || JSON.stringify(issue)));
+          }
+        });
+      }
+      return { verdict: obj.verdict, issues: issues };
+    }
 
-    return {
-      items: items,
-      wheelRotation: Math.round(wheelRotation) || 0,
-      radius: radius,
-      activeIndex: activeIndex,
-    };
+    // 1) Fenced ```json blocks first.
+    var fenceRe = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+    var m;
+    while ((m = fenceRe.exec(text)) !== null) {
+      try {
+        var found = normalize(JSON.parse(m[1]));
+        if (found) return found;
+      } catch (_) {}
+    }
+
+    // 2) Fallback: a brace-balanced object containing "verdict".
+    var idx = text.indexOf('"verdict"');
+    if (idx === -1) idx = text.indexOf("'verdict'");
+    if (idx === -1) return null;
+    var start = text.lastIndexOf("{", idx);
+    if (start === -1) return null;
+    var depth = 0;
+    for (var i = start; i < text.length; i++) {
+      if (text[i] === "{") depth++;
+      else if (text[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            var parsed = normalize(JSON.parse(text.slice(start, i + 1)));
+            if (parsed) return parsed;
+          } catch (_) {}
+          return null;
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -110,7 +243,9 @@
         } catch (_e) {
           message = response.statusText || message;
         }
-        throw new Error(message);
+        var error = new Error(message);
+        error.status = response.status;
+        throw error;
       }
 
       return response.json();
@@ -134,6 +269,10 @@
 
       getPipeline: function (pipelineId) {
         return request("/pipelines/" + pipelineId);
+      },
+
+      listPipelines: function () {
+        return request("/pipelines");
       },
 
       runUntilReview: function (pipelineId) {
@@ -162,7 +301,11 @@
 
   return {
     STAGES: STAGES,
+    STAGE_STATES: STAGE_STATES,
+    STAGE_STATE_LABELS: STAGE_STATE_LABELS,
+    resolveStageState: resolveStageState,
+    extractArtifactSummary: extractArtifactSummary,
+    parseReviewVerdict: parseReviewVerdict,
     createClient: createClient,
-    createStageWheelItems: createStageWheelItems,
   };
 });

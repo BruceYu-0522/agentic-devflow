@@ -70,7 +70,16 @@ MULTI_AGENT_CONFIG = {
             "  ## 改进建议\n  合并所有改进建议，按优先级排列\n\n"
             "- 每个章节开头注明来源 Agent（如「正确性审查 Agent 指出…」）\n"
             "- 不要遗漏任何报告中标记为严重或高危的问题\n"
-            "- 如果所有报告都认为代码质量良好，评审结论应为「建议交付」"
+            "- 如果所有报告都认为代码质量良好，评审结论应为「建议交付」\n"
+            "- 报告末尾另起一段，只输出一个 JSON 代码块作为机器可读结论，自动评审只认这个 JSON：\n"
+            "  ```json\n"
+            '  {"verdict": "pass", "issues": []}\n'
+            "  ```\n"
+            "  或驳回时：\n"
+            "  ```json\n"
+            '  {"verdict": "reject", "issues": ["具体问题1", "具体问题2"]}\n'
+            "  ```\n"
+            "  verdict 只能是 pass 或 reject；issues 是字符串数组，驳回时至少列出 1 条具体问题。"
         ),
     },
 }
@@ -89,10 +98,10 @@ def _run_single_agent(stage: Stage, pipeline: Pipeline, agent_spec: dict) -> tup
     skill_text = read_skill(stage.id)
     system_prompt = base_prompt + agent_spec["suffix"]
     if skill_text and len(skill_text) > 50:
-        system_prompt += f"\n\n工作规范（Skill）：\n{skill_text[:2000]}"
+        system_prompt += f"\n\n工作规范（Skill）：\n{skill_text}"
 
     payload = {
-        "model": llm_runner.MODEL_ROUTER[stage.id],
+        "model": llm_runner.get_model_for_stage(stage.id),
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -119,7 +128,7 @@ def _run_single_agent(stage: Stage, pipeline: Pipeline, agent_spec: dict) -> tup
     return None
 
 
-def _fallback_merge(results: list[tuple[str, str]]) -> str:
+def _fallback_merge(results: list[tuple[str, str]], failed: list[tuple[str, str]] | None = None) -> str:
     """Concatenate results directly when synthesis fails."""
     parts = [
         "## 多 Agent 并行评审报告",
@@ -130,6 +139,11 @@ def _fallback_merge(results: list[tuple[str, str]]) -> str:
         "> 💡 每个 Agent 使用相同的代码但不同的审查视角（System Prompt），确保审查覆盖全面。",
         "",
     ]
+    if failed:
+        parts.append("## ⚠️ 未返回结果的评审员")
+        for agent_name, reason in failed:
+            parts.append(f"- {agent_name}：未返回有效结果（{reason}）")
+        parts.append("")
     emoji_map = {
         "正确性审查": "✅",
         "安全性审查": "🔒",
@@ -141,17 +155,17 @@ def _fallback_merge(results: list[tuple[str, str]]) -> str:
     return "\n".join(parts)
 
 
-def _try_synthesize(stage_id: str, results: list[tuple[str, str]]) -> str:
+def _try_synthesize(stage_id: str, results: list[tuple[str, str]], failed: list[tuple[str, str]] | None = None) -> str:
     """Try using a synthesizer LLM call to merge results; fall back to direct merge."""
     config = MULTI_AGENT_CONFIG.get(stage_id)
     if not config or len(results) <= 1:
-        return _fallback_merge(results)
+        return _fallback_merge(results, failed)
 
     reports_block = "\n\n---\n\n".join(
         f"### {agent_name}\n{content}" for agent_name, content in results
     )
     payload = {
-        "model": llm_runner.MODEL_ROUTER.get(stage_id, "deepseek-v4-flash"),
+        "model": llm_runner.get_model_for_stage(stage_id),
         "messages": [
             {"role": "system", "content": config["synthesizer_prompt"]},
             {"role": "user", "content": f"以下是 {len(results)} 份独立审查报告，请整合：\n\n{reports_block}"},
@@ -163,26 +177,34 @@ def _try_synthesize(stage_id: str, results: list[tuple[str, str]]) -> str:
         response = llm_runner.post_chat_completion(payload, stage_id)
         content = llm_runner.extract_content(response)
         if content and len(content) > 50:
+            if failed:
+                content += "\n\n## ⚠️ 未返回结果的评审员\n" + "\n".join(
+                    f"- {name}：未返回有效结果（{reason}）" for name, reason in failed
+                )
             return content
     except Exception:
         pass
 
-    return _fallback_merge(results)
+    return _fallback_merge(results, failed)
 
 
 def run_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> tuple[str, str] | None:
     """Run multiple agents in parallel and aggregate their output.
 
     Returns (aggregated_content, model_name) or None if all agents fail.
+    Results are always ordered by the configured reviewer order (not by
+    completion order), and reviewers that fail are explicitly recorded in
+    the aggregated report as "未返回" instead of being silently dropped.
     """
     config = MULTI_AGENT_CONFIG.get(stage.id)
     if not config:
         return None
 
     agents = config["agents"]
-    model = llm_runner.MODEL_ROUTER.get(stage.id, "unknown")
+    model = llm_runner.get_model_for_stage(stage.id)
 
-    results: list[tuple[str, str]] = []
+    by_name: dict[str, str] = {}
+    failed: list[tuple[str, str]] = []
     with ThreadPoolExecutor(max_workers=len(agents)) as executor:
         futures = {
             executor.submit(_run_single_agent, stage, pipeline, agent_spec): agent_spec
@@ -194,14 +216,19 @@ def run_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> tuple[str, str] |
                 result = future.result()
                 if result:
                     content, _ = result
-                    results.append((agent_spec["name"], content))
-            except Exception:
-                pass
+                    by_name[agent_spec["name"]] = content
+                else:
+                    failed.append((agent_spec["name"], "未返回有效结果"))
+            except Exception as exc:
+                failed.append((agent_spec["name"], f"执行异常：{exc}"))
 
-    if not results:
+    if not by_name:
         return None
 
-    aggregated = _try_synthesize(stage.id, results)
+    # Fixed order: the configured reviewer order, regardless of completion order.
+    results = [(spec["name"], by_name[spec["name"]]) for spec in agents if spec["name"] in by_name]
+    failed.sort(key=lambda item: [spec["name"] for spec in agents].index(item[0]))
+    aggregated = _try_synthesize(stage.id, results, failed or None)
     return aggregated, model
 
 
@@ -222,14 +249,15 @@ async def stream_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> AsyncGen
         return
 
     agents = config["agents"]
-    model = llm_runner.MODEL_ROUTER.get(stage.id, "unknown")
+    model = llm_runner.get_model_for_stage(stage.id)
 
     yield f"event: stage\ndata: {stage.name}\n\n"
     yield f"event: system\ndata: 启动多 Agent 并行评审（{len(agents)} 个独立 Agent 同时审查，模型 {model}）…\n\n"
     yield f"event: system\ndata: Agent 1️⃣ 正确性审查 · Agent 2️⃣ 安全性审查 · Agent 3️⃣ 规范性审查 同时工作中…\n\n"
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     results: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
 
     # Submit all agents to thread pool
     agent_futures = []
@@ -240,7 +268,7 @@ async def stream_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> AsyncGen
         )
         agent_futures.append((agent_spec, future))
 
-    # Wait for each to complete and report
+    # Wait for each to complete and report (in configured reviewer order)
     for agent_spec, future in agent_futures:
         try:
             result = await future
@@ -249,9 +277,11 @@ async def stream_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> AsyncGen
                 results.append((agent_spec["name"], content))
                 yield f"event: system\ndata: {agent_spec['name']} 完成（{len(content)} 字符）\n\n"
             else:
+                failed.append((agent_spec["name"], "未返回有效结果"))
                 yield f"event: system\ndata: {agent_spec['name']} 未返回有效结果\n\n"
-        except Exception:
-            yield f"event: system\ndata: {agent_spec['name']} 执行失败\n\n"
+        except Exception as exc:
+            failed.append((agent_spec["name"], f"执行异常：{exc}"))
+            yield f"event: system\ndata: {agent_spec['name']} 执行失败：{exc}\n\n"
 
     if not results:
         yield "event: fail\ndata: 所有审查者均未返回有效结果\n\n"
@@ -259,6 +289,6 @@ async def stream_multi_agent_stage(stage: Stage, pipeline: Pipeline) -> AsyncGen
 
     yield "event: system\ndata: 正在汇总多 Agent 审查结果…\n\n"
 
-    aggregated = _try_synthesize(stage.id, results)
+    aggregated = _try_synthesize(stage.id, results, failed or None)
     yield f"event: system\ndata: 已接收汇总结果（{len(aggregated)} 字符），正在处理产物…\n\n"
     yield f"event: result\ndata: {json.dumps({'content': aggregated, 'model': model})}\n\n"

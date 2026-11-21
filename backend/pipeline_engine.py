@@ -7,9 +7,10 @@ from fastapi import HTTPException
 
 from backend.code_executor import apply_llm_code_patch, apply_llm_test_patch
 from backend.llm_runner import (
-    MODEL_ROUTER,
     generate_requirement_prototype,
     generate_visual_plan,
+    get_last_llm_error,
+    get_model_for_stage,
     run_llm_agent,
     run_llm_agent_with_metrics,
     stream_llm_agent,
@@ -30,6 +31,8 @@ from backend.git_manager import (
     get_branch_name,
     get_diff_summary,
     get_git_status_for_display,
+    reset_to_commit,
+    rollback_before_commit,
 )
 from backend.schemas import Artifact, Pipeline, ReviewRecord, ReviewRequest, Stage
 from backend.skills import get_skill_info
@@ -105,6 +108,40 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _mark_failed(pipeline: Pipeline, stage_id: str, reason: str) -> None:
+    """Record a stage/pipeline failure (a): status failed + reason persisted."""
+    pipeline.status = "failed"
+    pipeline.failedStage = stage_id
+    pipeline.failureReason = reason
+    pipeline.stageFailures[stage_id] = reason
+
+
+def _clear_failure(pipeline: Pipeline, stage_id: str | None = None) -> None:
+    """Clear failure markers when a (re-)run starts."""
+    pipeline.failureReason = None
+    pipeline.failedStage = None
+    if stage_id:
+        pipeline.stageFailures.pop(stage_id, None)
+
+
+def _llm_failure_detail(stage_name: str) -> str:
+    """Build the 503 detail for an empty LLM result, distinguishing a
+    rate-limit/network failure from a configuration error (g)."""
+    message, kind = get_last_llm_error()
+    if message:
+        if kind == "transient":
+            return f"{stage_name} 需要大模型支持但调用失败（限流/网络，可重试）：{message}"
+        if kind == "config":
+            return f"{stage_name} 需要大模型支持但调用失败（配置错误）：{message}"
+        return f"{stage_name} 需要大模型支持但返回了空内容。{message}"
+    return (
+        f"{stage_name} 需要大模型支持但返回了空内容。请确认：\n"
+        "1. 已设置环境变量 DEVFLOW_LLM_ENABLED=true\n"
+        "2. 已设置 DEVFLOW_LLM_API_KEY\n"
+        "3. DEVFLOW_LLM_BASE_URL 指向有效的 API 端点"
+    )
+
+
 def save_workspace_files(pipeline: Pipeline) -> Path:
     """Save all pipeline artifacts as files in the workspace directory."""
     workspace = RUNS_DIR / pipeline.id / "workspace"
@@ -119,6 +156,78 @@ def save_workspace_files(pipeline: Pipeline) -> Path:
             (workspace / "prototype.html").write_text(artifact.prototypeHtml, encoding="utf-8")
 
     return workspace
+
+
+def _rejected_stage_ids(pipeline: Pipeline, stage: Stage) -> list[str]:
+    """Stages whose artifacts must go on a reject: the rejected stage, all
+    later stages, plus code/test when the review stage is rejected."""
+    idx = stage_index(pipeline, stage.id)
+    removed = [s.id for s in pipeline.stages[idx:]]
+    if stage.id == "review":
+        for sid in ("code", "test"):
+            if sid not in removed:
+                removed.append(sid)
+    return removed
+
+
+def _apply_rejection(pipeline: Pipeline, stage: Stage, reason: str) -> None:
+    """Shared by manual submit_review and auto-regression (e).
+
+    Pops the rejected artifacts from memory, deletes the rejected stage's
+    (and later stages') workspace files from disk, and rolls the workspace
+    git repo back to before the rejected work. If git rollback is not
+    possible, the code/test/review files are kept but marked at the top as
+    a rejected version instead of being deleted.
+    """
+    removed = _rejected_stage_ids(pipeline, stage)
+    for sid in removed:
+        pipeline.artifacts.pop(sid, None)
+
+    run_root = RUNS_DIR / pipeline.id
+    workspace = run_root / "workspace"
+    needs_git = bool({"code", "test"} & set(removed))
+    rollback_ok = True
+    if needs_git:
+        if "code" in removed:
+            # Roll back to the pristine snapshot taken before code gen.
+            rollback_ok = reset_to_commit(run_root, "chore: snapshot before code generation")
+        else:
+            # Only the test stage is rejected: keep the code commit.
+            rollback_ok = rollback_before_commit(run_root, "test: ")
+
+    for sid in removed:
+        fname = STAGE_FILE_NAMES.get(sid)
+        if not fname:
+            continue
+        fpath = workspace / fname
+        if not fpath.exists():
+            continue
+        if needs_git and not rollback_ok and sid in ("code", "test", "review"):
+            # Rollback infeasible: keep the file, marked as a rejected version.
+            header = (
+                f"> **已驳回版本**：{reason}\n"
+                "> （Git 回滚不可行，该文件为被驳回阶段的产物，请勿直接使用。）\n\n"
+            )
+            try:
+                fpath.write_text(header + fpath.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
+        else:
+            try:
+                fpath.unlink()
+            except OSError:
+                pass
+    if "requirement" in removed:
+        proto = workspace / "prototype.html"
+        if proto.exists():
+            try:
+                proto.unlink()
+            except OSError:
+                pass
+
+    if stage.id == "review":
+        pipeline.currentStageId = "code"
+    pipeline.status = "ready"
 
 
 def _get_template_stages(template: str) -> list[tuple[str, str, str, bool]]:
@@ -157,6 +266,7 @@ def create_pipeline(requirement: str, project_path: str | None = None, template:
     if not clean_requirement:
         raise HTTPException(status_code=422, detail="需求描述不能为空。请输入你想要实现的功能需求。")
     stages = build_stages(template)
+    created = now_iso()
     pipeline = Pipeline(
         id=f"df-{uuid4().hex[:10]}",
         requirement=clean_requirement,
@@ -165,6 +275,8 @@ def create_pipeline(requirement: str, project_path: str | None = None, template:
         status="ready",
         currentStageId=stages[0].id,
         stages=stages,
+        createdAt=created,
+        updatedAt=created,
     )
 
     # Eagerly build code index when projectPath is set
@@ -175,6 +287,32 @@ def create_pipeline(requirement: str, project_path: str | None = None, template:
 
 
 def run_next_stage(pipeline: Pipeline) -> Pipeline:
+    """Run the current stage, tracking running/failed state (a).
+
+    Sets status "running" while executing; on any exception marks the
+    pipeline "failed" with the reason (persisted by the caller via
+    store.save) and re-raises so the API still returns the original error.
+    A failed (or stale-running) pipeline can be retried.
+    """
+    if pipeline.status in {"completed", "waiting_review"}:
+        return pipeline
+
+    stage = current_stage(pipeline)
+    if pipeline.status in {"failed", "running"}:
+        _clear_failure(pipeline, stage.id)
+    pipeline.status = "running"
+    try:
+        return _run_next_stage_inner(pipeline)
+    except HTTPException as exc:
+        _mark_failed(pipeline, stage.id, str(exc.detail))
+        raise
+    except Exception as exc:
+        reason = f"{stage.name}执行失败：{exc}"
+        _mark_failed(pipeline, stage.id, reason)
+        raise HTTPException(status_code=503, detail=reason)
+
+
+def _run_next_stage_inner(pipeline: Pipeline) -> Pipeline:
     if pipeline.status in {"completed", "waiting_review"}:
         return pipeline
 
@@ -196,6 +334,18 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
     reasoning_content = ""
 
     if stage.id == "code":
+        # Snapshot the pristine sandbox before the patch so a later reject
+        # can roll git back to the pre-code state (e). Best-effort: a
+        # snapshot failure must not block code generation.
+        run_root = RUNS_DIR / pipeline.id
+        try:
+            from backend.code_executor import prepare_workspace
+
+            prepare_workspace(pipeline)
+            ensure_git_repo(run_root)
+            commit_changes(run_root, "chore: snapshot before code generation")
+        except Exception:
+            pass
         result = apply_llm_code_patch(pipeline)
         if not result:
             from backend.code_executor import get_last_code_error
@@ -211,7 +361,15 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
 
         run_root = RUNS_DIR / pipeline.id
         ensure_git_repo(run_root)
-        commit_changes(run_root, f"feat: {pipeline.requirement[:80]}")
+        try:
+            commit_changes(run_root, f"feat: {pipeline.requirement[:80]}")
+        except RuntimeError as exc:
+            # (f) a failed git commit must surface instead of silently
+            # pretending the change was committed.
+            raise HTTPException(
+                status_code=503,
+                detail=f"代码生成阶段 Git 提交失败：{exc}",
+            )
         create_devflow_branch(run_root, get_branch_name(pipeline.id))
         build_and_cache_index(pipeline.id)
 
@@ -230,7 +388,13 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
         workspace_path = result.workspace_path
 
         run_root = RUNS_DIR / pipeline.id
-        commit_changes(run_root, f"test: add tests for {pipeline.requirement[:60]}")
+        try:
+            commit_changes(run_root, f"test: add tests for {pipeline.requirement[:60]}")
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"测试生成阶段 Git 提交失败：{exc}",
+            )
         build_and_cache_index(pipeline.id)
 
     else:
@@ -239,12 +403,7 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
             if not llm_result:
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        f"{stage.agent} 需要大模型支持但返回了空内容。请确认：\n"
-                        "1. 已设置环境变量 DEVFLOW_LLM_ENABLED=true\n"
-                        "2. 已设置 DEVFLOW_LLM_API_KEY\n"
-                        "3. DEVFLOW_LLM_BASE_URL 指向有效的 API 端点"
-                    ),
+                    detail=_llm_failure_detail(stage.agent),
                 )
             content, model = llm_result
             usage = {}
@@ -257,12 +416,7 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
             if not llm_result:
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        f"{stage.agent} 需要大模型支持但返回了空内容。请确认：\n"
-                        "1. 已设置环境变量 DEVFLOW_LLM_ENABLED=true\n"
-                        "2. 已设置 DEVFLOW_LLM_API_KEY\n"
-                        "3. DEVFLOW_LLM_BASE_URL 指向有效的 API 端点"
-                    ),
+                    detail=_llm_failure_detail(stage.agent),
                 )
             content, model, usage, reasoning_content = llm_result
             prompt_tokens = usage.get("prompt_tokens", 0) if usage else 0
@@ -313,57 +467,46 @@ def run_next_stage(pipeline: Pipeline) -> Pipeline:
     return pipeline
 
 
-def run_until_review(pipeline: Pipeline) -> Pipeline:
-    while pipeline.status == "ready":
-        run_next_stage(pipeline)
-    return pipeline
-
-
 MAX_REVIEW_RETRIES = 3
 MAX_AUTO_REGRESSION_RETRIES = 3
 
-# Keywords that indicate a negative review (should trigger auto-regression)
-_AUTO_REJECT_SIGNALS = [
-    "需要修改", "不建议交付", "必须修复", "严重问题", "安全漏洞",
-    "存在风险", "不可交付", "需要重新", "建议驳回", "不符合要求",
-    "代码有误", "逻辑错误", "不通过", "需要调整", "无法正常工作",
-    "存在问题", "需要改进", "不建议合并",
-]
-
-_AUTO_APPROVE_SIGNALS = [
-    "建议交付", "可以交付", "通过评审", "建议通过", "可以合并",
-    "代码质量良好", "审查通过", "没有问题",
-]
-
 
 def auto_evaluate_review(review_content: str) -> tuple[bool, str]:
-    """Analyze review content for auto-regression decisions.
+    """Evaluate a review-stage artifact for auto-regression (h).
 
-    Returns (is_approved: bool, feedback: str).
+    The review agent must end its report with a JSON verdict block:
+    {"verdict": "pass"|"reject", "issues": [...]}. Only that structured
+    verdict counts — no keyword scanning of the prose.
+
+    Returns (is_approved, feedback). An unparseable/missing verdict is
+    treated as a reject (fail closed) with the reason recorded.
     """
     if not review_content:
+        return False, "自动评审未返回内容，视为驳回，需人工确认"
+
+    from backend.code_executor import extract_json_object
+
+    verdict_doc = extract_json_object(review_content)
+    if not isinstance(verdict_doc, dict) or "verdict" not in verdict_doc:
+        return False, "自动评审未返回结构化结论（缺少 verdict JSON），视为驳回，需人工确认"
+    verdict = str(verdict_doc.get("verdict", "")).strip().lower()
+    issues = verdict_doc.get("issues") or []
+    if verdict == "pass":
         return True, ""
-
-    content_lower = review_content.lower()
-
-    # Check for negative signals
-    reject_reasons = []
-    for signal in _AUTO_REJECT_SIGNALS:
-        if signal in review_content:
-            reject_reasons.append(signal)
-
-    # Check for explicit approval signals
-    has_approval = any(signal in review_content for signal in _AUTO_APPROVE_SIGNALS)
-
-    if reject_reasons and not has_approval:
-        # Extract the context around the first reject signal for feedback
-        reason = "、".join(reject_reasons[:3])
-        return False, f"自动检测到评审问题：{reason}"
-
-    return True, ""
+    if verdict == "reject":
+        if isinstance(issues, list) and issues:
+            detail = "、".join(str(i) for i in issues[:5])
+        else:
+            detail = "评审结论为驳回（未列出具体问题）"
+        return False, f"自动评审驳回：{detail}"
+    return False, f"自动评审结论无效（verdict={verdict_doc.get('verdict')!r}），视为驳回，需人工确认"
 
 
 def run_until_review(pipeline: Pipeline, auto_mode: bool = False) -> Pipeline:
+    # Stale "running"/"failed" states are resumable (e.g. after a restart):
+    # a retry starts from the current stage instead of being stuck.
+    if pipeline.status in {"running", "failed"}:
+        pipeline.status = "ready"
     while pipeline.status == "ready":
         run_next_stage(pipeline)
 
@@ -371,37 +514,41 @@ def run_until_review(pipeline: Pipeline, auto_mode: bool = False) -> Pipeline:
             stage = current_stage(pipeline)
             artifact = pipeline.artifacts.get(stage.id)
             if artifact:
-                approved, feedback = auto_evaluate_review(artifact.content)
+                # Only the review stage gets a structured auto-evaluation;
+                # other stages auto-approve (there is no review verdict yet).
+                if stage.id == "review":
+                    approved, feedback = auto_evaluate_review(artifact.content)
+                else:
+                    approved, feedback = True, ""
                 if not approved:
                     auto_retries = sum(
                         1 for r in pipeline.reviewHistory
                         if r.stageId == stage.id and r.decision == "reject"
                     )
                     if auto_retries >= MAX_AUTO_REGRESSION_RETRIES:
-                        # Force approve after max retries
-                        pipeline.reviewHistory.append(ReviewRecord(
-                            stageId=stage.id,
-                            stageName=stage.name,
-                            decision="approve",
-                            reason=f"自动回归已达最大重试次数({MAX_AUTO_REGRESSION_RETRIES})，强制通过",
-                            createdAt=now_iso(),
-                        ))
-                    else:
-                        # Auto-reject: remove artifacts and reset to code
+                        # (h) No forced pass: stop at waiting_review so a
+                        # human must decide. The artifact is kept for review.
                         pipeline.reviewHistory.append(ReviewRecord(
                             stageId=stage.id,
                             stageName=stage.name,
                             decision="reject",
-                            reason=feedback,
+                            reason=(
+                                f"自动评审连续驳回已达 {MAX_AUTO_REGRESSION_RETRIES} 次，"
+                                f"转人工审批：{feedback}"
+                            ),
                             createdAt=now_iso(),
                         ))
-                        pipeline.artifacts.pop(stage.id, None)
-                        if stage.id == "review":
-                            pipeline.artifacts.pop("code", None)
-                            pipeline.artifacts.pop("test", None)
-                            pipeline.currentStageId = "code"
-                        pipeline.status = "ready"
-                        continue
+                        return pipeline
+                    # Auto-reject: clean up artifacts/files and roll back git.
+                    pipeline.reviewHistory.append(ReviewRecord(
+                        stageId=stage.id,
+                        stageName=stage.name,
+                        decision="reject",
+                        reason=feedback,
+                        createdAt=now_iso(),
+                    ))
+                    _apply_rejection(pipeline, stage, feedback)
+                    continue
                 # Auto-approve
                 pipeline.reviewHistory.append(ReviewRecord(
                     stageId=stage.id,
@@ -455,14 +602,10 @@ def submit_review(pipeline: Pipeline, request: ReviewRequest) -> Pipeline:
     )
 
     if request.decision == "reject":
-        # Remove the rejected stage's artifact so it will be re-generated
-        pipeline.artifacts.pop(stage.id, None)
-        # If rejecting review stage, go back to code stage and remove downstream artifacts
-        if stage.id == "review":
-            pipeline.artifacts.pop("code", None)
-            pipeline.artifacts.pop("test", None)
-            pipeline.currentStageId = "code"
-        pipeline.status = "ready"
+        # (e) Remove the rejected artifact, delete its workspace files, and
+        # roll the workspace git repo back. Caller persists via store.save,
+        # so status + artifacts stay consistent on disk (d).
+        _apply_rejection(pipeline, stage, reason)
         return pipeline
 
     if stage.id == "delivery":
@@ -480,13 +623,20 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
     import json
     from time import perf_counter
 
-    while pipeline.status == "ready":
+    # Stale "running"/"failed" states are resumable (e.g. after a restart).
+    if pipeline.status in {"running", "failed"}:
+        _clear_failure(pipeline, pipeline.currentStageId)
+        pipeline.status = "ready"
+    pipeline.status = "running"
+    while pipeline.status in {"ready", "running"}:
         stage = current_stage(pipeline)
         stage_start_perf = perf_counter()
         stage_started_at = now_iso()
+        # (c) heartbeat so clients can tell a live stream from a stalled one.
+        yield 'event: heartbeat\ndata: {"type": "heartbeat"}\n\n'
 
         if stage.id in ("code", "test"):
-            model_name = MODEL_ROUTER.get(stage.id, "unknown")
+            model_name = get_model_for_stage(stage.id)
             yield "event: stage\ndata: " + stage.name + "\n\n"
             yield "event: system\ndata: 正在调用 " + model_name + " 模型…\n\n"
             yield "event: system\ndata: 正在执行 " + stage.name + "（非流式）…\n\n"
@@ -546,6 +696,7 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
                             pass
 
             if not full_content:
+                _mark_failed(pipeline, stage.id, f"{stage.name}失败：LLM 返回了空内容")
                 yield "event: fail\ndata: LLM 返回了空内容\n\n"
                 return
 
@@ -591,8 +742,6 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
 
             save_workspace_files(pipeline)
 
-            save_workspace_files(pipeline)
-
             # Emit stats event for streaming stages
             yield "event: stats\ndata: " + json.dumps({
                 "stageId": stage.id,
@@ -616,9 +765,13 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
             return
 
         if stage.approvalRequired and auto_mode:
-            # Auto-evaluate review content
+            # Only the review stage gets a structured auto-evaluation;
+            # other stages auto-approve (there is no review verdict yet).
             artifact = pipeline.artifacts.get(stage.id)
-            approved, feedback = auto_evaluate_review(artifact.content if artifact else "")
+            if stage.id == "review":
+                approved, feedback = auto_evaluate_review(artifact.content if artifact else "")
+            else:
+                approved, feedback = True, ""
 
             if not approved:
                 auto_retries = sum(
@@ -626,32 +779,33 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
                     if r.stageId == stage.id and r.decision == "reject"
                 )
                 if auto_retries >= MAX_AUTO_REGRESSION_RETRIES:
-                    yield f"event: system\ndata: 自动回归已达最大重试次数({MAX_AUTO_REGRESSION_RETRIES})，强制通过\n\n"
-                    pipeline.reviewHistory.append(ReviewRecord(
-                        stageId=stage.id,
-                        stageName=stage.name,
-                        decision="approve",
-                        reason=f"自动回归已达最大重试次数({MAX_AUTO_REGRESSION_RETRIES})，强制通过",
-                        createdAt=now_iso(),
-                    ))
-                else:
-                    retry_num = auto_retries + 1
-                    yield f"event: auto_regression\ndata: {json.dumps({'retry': retry_num, 'maxRetries': MAX_AUTO_REGRESSION_RETRIES, 'reason': feedback, 'stageName': stage.name})}\n\n"
-                    yield f"event: system\ndata: 检测到评审问题（{feedback}），自动打回重新生成（{retry_num}/{MAX_AUTO_REGRESSION_RETRIES}）\n\n"
+                    # (h) No forced pass: stop at waiting_review for a human.
+                    yield f"event: system\ndata: 自动评审连续驳回已达 {MAX_AUTO_REGRESSION_RETRIES} 次，转人工审批\n\n"
                     pipeline.reviewHistory.append(ReviewRecord(
                         stageId=stage.id,
                         stageName=stage.name,
                         decision="reject",
-                        reason=feedback,
+                        reason=(
+                            f"自动评审连续驳回已达 {MAX_AUTO_REGRESSION_RETRIES} 次，"
+                            f"转人工审批：{feedback}"
+                        ),
                         createdAt=now_iso(),
                     ))
-                    pipeline.artifacts.pop(stage.id, None)
-                    if stage.id == "review":
-                        pipeline.artifacts.pop("code", None)
-                        pipeline.artifacts.pop("test", None)
-                        pipeline.currentStageId = "code"
-                    pipeline.status = "ready"
-                    continue
+                    pipeline.status = "waiting_review"
+                    yield "event: done\ndata: \n\n"
+                    return
+                retry_num = auto_retries + 1
+                yield f"event: auto_regression\ndata: {json.dumps({'retry': retry_num, 'maxRetries': MAX_AUTO_REGRESSION_RETRIES, 'reason': feedback, 'stageName': stage.name})}\n\n"
+                yield f"event: system\ndata: 检测到评审问题（{feedback}），自动打回重新生成（{retry_num}/{MAX_AUTO_REGRESSION_RETRIES}）\n\n"
+                pipeline.reviewHistory.append(ReviewRecord(
+                    stageId=stage.id,
+                    stageName=stage.name,
+                    decision="reject",
+                    reason=feedback,
+                    createdAt=now_iso(),
+                ))
+                _apply_rejection(pipeline, stage, feedback)
+                continue
             else:
                 pipeline.reviewHistory.append(ReviewRecord(
                     stageId=stage.id,
@@ -660,6 +814,7 @@ async def run_until_review_with_stream(pipeline, auto_mode: bool = False):
                     reason="自动通过（auto mode）",
                     createdAt=now_iso(),
                 ))
+                pipeline.status = "ready"
 
         if stage.id == "delivery":
             pipeline.status = "completed"
@@ -749,12 +904,14 @@ async def stream_element_modification(
                     target_file.write_text(new_content, encoding="utf-8", errors="replace")
                     yield f"event: system\ndata: 文件 {source_file} 已更新\n\n"
 
+                    commit_info = None
                     try:
-                        commit_hash = commit_changes(
+                        commit_info = commit_changes(
                             run_root, f"edit: modify {source_file} - {change_request[:60]}"
                         )
-                        if commit_hash:
-                            yield f"event: system\ndata: Git 提交成功 ({commit_hash[:7]})\n\n"
+                        if commit_info:
+                            commit_hash = commit_info.get("hash")
+                            yield f"event: system\ndata: Git 提交成功 ({(commit_hash or '')[:7]})\n\n"
                     except Exception:
                         yield "event: system\ndata: Git 提交失败，文件修改已生效\n\n"
 

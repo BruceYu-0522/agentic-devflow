@@ -57,15 +57,21 @@ class Pipeline(BaseModel):
     requirement: str
     template: str = "feature"
     projectPath: Optional[str] = None
-    status: Literal["ready", "waiting_review", "completed"]
+    status: Literal["ready", "running", "waiting_review", "completed", "failed"]
     currentStageId: str
     stages: List[Stage]
     artifacts: Dict[str, Artifact] = Field(default_factory=dict)
     reviewHistory: List[ReviewRecord] = Field(default_factory=list)
+    # Failure observability (a): set when status becomes "failed".
+    failureReason: Optional[str] = None
+    failedStage: Optional[str] = None
+    # Per-stage failure reasons, keyed by stage id.
+    stageFailures: Dict[str, str] = Field(default_factory=dict)
     # Observability fields
     createdAt: str = ""
     startedAt: str = ""
     completedAt: str = ""
+    updatedAt: str = ""
 
 
 class CreatePipelineRequest(BaseModel):

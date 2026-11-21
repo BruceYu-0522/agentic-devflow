@@ -7,6 +7,7 @@ window.addEventListener("unhandledrejection", function (event) {
 });
 
 var STAGES = window.DevFlowCore.STAGES;
+var core = window.DevFlowCore;
 var client = window.DevFlowCore.createClient(window.DEVFLOW_API_BASE);
 var artifactRenderer = window.DevFlowArtifactRenderer;
 var clarificationFlow = window.DevFlowClarificationFlow;
@@ -19,29 +20,37 @@ var abortController = null;
 var pendingRequirement = "";
 var pendingTemplate = "feature";
 var liveOutputEventSource = null;
+var lastHeartbeatAt = 0;
+var liveLineCount = 0;
 var clarificationStepIndex = 0;
 var clarificationAnswers = {};
+var userToggledSections = {}; // stageId → true（用户手动折叠/展开过，渲染时保留他的选择）
+
+var STORAGE_KEY = "devflow:lastPipelineId";
 
 var elements = {
   form: document.querySelector("#requestForm"),
   requirementInput: document.querySelector("#requirementInput"),
   templateSelector: document.querySelector("#templateSelector"),
   resetButton: document.querySelector("#resetButton"),
+  historyButton: document.querySelector("#historyButton"),
+  historyPanel: document.querySelector("#historyPanel"),
+  historyList: document.querySelector("#historyList"),
+  historyClose: document.querySelector("#historyClose"),
   deliveryPackage: document.querySelector("#deliveryPackage"),
   productPreviewSection: document.querySelector("#productPreviewSection"),
   productPreviewFrame: document.querySelector("#productPreviewFrame"),
   productPreviewLink: document.querySelector("#productPreviewLink"),
   productExpandBtn: document.querySelector("#productExpandBtn"),
   productFrameWrap: document.querySelector("#productFrameWrap"),
-  prototypeFrameWrap: document.querySelector("#prototypeFrameWrap"),
-  deliverySummaryTitle: document.querySelector("#deliverySummaryTitle"),
-  deliverySummaryText: document.querySelector("#deliverySummaryText"),
-  deliveryValidationTitle: document.querySelector("#deliveryValidationTitle"),
-  deliveryValidationText: document.querySelector("#deliveryValidationText"),
+  deliverySummaryBody: document.querySelector("#deliverySummaryBody"),
+  deliveryStats: document.querySelector("#deliveryStats"),
   deliveryFiles: document.querySelector("#deliveryFiles"),
   pipelineStatus: document.querySelector("#pipelineStatus"),
   stageCount: document.querySelector("#stageCount"),
   stageList: document.querySelector("#stageList"),
+  reviewCountBadge: document.querySelector("#reviewCountBadge"),
+  failureBanner: document.querySelector("#failureBanner"),
   // Live output
   liveOutput: document.querySelector("#liveOutput"),
   obsPanel: document.querySelector("#obsPanel"),
@@ -51,30 +60,21 @@ var elements = {
   liveOutputTitle: document.querySelector("#liveOutputTitle"),
   liveOutputStage: document.querySelector("#liveOutputStage"),
   liveOutputEmpty: document.querySelector("#liveOutputEmpty"),
+  liveOutputSummary: document.querySelector("#liveOutputSummary"),
+  liveOutputSummaryText: document.querySelector("#liveOutputSummaryText"),
+  liveOutputExpandBtn: document.querySelector("#liveOutputExpandBtn"),
   // Artifacts
   currentAgent: document.querySelector("#currentAgent"),
   artifactEmpty: document.querySelector("#artifactEmpty"),
   artifactCard: document.querySelector("#artifactCard"),
   artifactSections: document.querySelector("#artifactSections"),
-  // Template elements (kept in hidden div, moved into sections when rendering)
-  prdMap: document.querySelector("#prdMap"),
-  prdMapTitle: document.querySelector("#prdMapTitle"),
-  prdMapSummary: document.querySelector("#prdMapSummary"),
-  prdMapFlow: document.querySelector("#prdMapFlow"),
-  visualPlan: document.querySelector("#visualPlan"),
-  visualPlanTitle: document.querySelector("#visualPlanTitle"),
-  visualPlanSummary: document.querySelector("#visualPlanSummary"),
-  blueprintFlow: document.querySelector("#blueprintFlow"),
-  blueprintRisks: document.querySelector("#blueprintRisks"),
-  prototypePreview: document.querySelector("#prototypePreview"),
-  prototypeTitle: document.querySelector("#prototypeTitle"),
-  prototypeDesc: document.querySelector("#prototypeDesc"),
-  prototypeFrame: document.querySelector("#prototypeFrame"),
-  prototypeExpandBtn: document.querySelector("#prototypeExpandBtn"),
+  // Approval bar (sticky, top of the artifact panel)
+  approvalBar: document.querySelector("#approvalBar"),
+  approvalStageName: document.querySelector("#approvalStageName"),
   reviewPanel: document.querySelector("#review"),
   reviewState: document.querySelector("#reviewState"),
-  reviewEmpty: document.querySelector("#reviewEmpty"),
-  reviewControls: document.querySelector("#reviewControls"),
+  reviewHistoryEmpty: document.querySelector("#reviewHistoryEmpty"),
+  reviewHistoryList: document.querySelector("#reviewHistoryList"),
   rejectReason: document.querySelector("#rejectReason"),
   approveButton: document.querySelector("#approveButton"),
   rejectButton: document.querySelector("#rejectButton"),
@@ -83,6 +83,7 @@ var elements = {
   clarificationRequirement: document.querySelector("#clarificationRequirement"),
   clarificationQuestions: document.querySelector("#clarificationQuestions"),
   clarificationCancel: document.querySelector("#clarificationCancel"),
+  clarificationSkip: document.querySelector("#clarificationSkip"),
   clarificationRecommend: document.querySelector("#clarificationRecommend"),
   clarificationProgress: document.querySelector("#clarificationProgress"),
   clarificationStepLabel: document.querySelector("#clarificationStepLabel"),
@@ -145,48 +146,72 @@ function getProductPreviewUrl() {
   return window.DEVFLOW_API_BASE + "/runs/" + pipeline.id + "/target-app/index.html";
 }
 
+// ── localStorage：刷新恢复 ──
+
+function saveLastPipelineId(id) {
+  try { localStorage.setItem(STORAGE_KEY, id); } catch (_) {}
+}
+
+function loadLastPipelineId() {
+  try { return localStorage.getItem(STORAGE_KEY); } catch (_) { return null; }
+}
+
+function clearLastPipelineId() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+}
+
+// ── 顶部状态徽标：如实反映状态，ready 下绝不显示运行中样式 ──
+
 function setStatusBadge() {
-  elements.pipelineStatus.classList.remove("is-running", "is-review", "is-done");
+  var pill = elements.pipelineStatus;
+  pill.classList.remove("is-running", "is-review", "is-done", "is-failed");
+  pill.title = "";
 
   if (runErrorMessage) {
-    elements.pipelineStatus.textContent = "错误：" + runErrorMessage;
-    elements.pipelineStatus.style.color = "var(--accent-danger)";
-    elements.pipelineStatus.style.borderColor = "rgba(245,74,69,0.28)";
-    elements.pipelineStatus.style.background = "rgba(245,74,69,0.12)";
+    pill.textContent = "错误：" + runErrorMessage;
+    pill.classList.add("is-failed");
     return;
   }
-  elements.pipelineStatus.style.color = "";
-  elements.pipelineStatus.style.borderColor = "";
-  elements.pipelineStatus.style.background = "";
 
-  if (isRunning) {
-    elements.pipelineStatus.textContent = "运行中";
-    elements.pipelineStatus.classList.add("is-running");
+  if (isRunning || (pipeline && pipeline.status === "running")) {
+    pill.textContent = "运行中";
+    pill.classList.add("is-running");
     return;
   }
 
   if (!pipeline) {
-    elements.pipelineStatus.textContent = "未开始";
+    pill.textContent = "未开始";
+    return;
+  }
+
+  if (pipeline.status === "failed") {
+    var failedStage = getStages().filter(function (s) { return s.id === (pipeline.failed_stage || pipeline.failedStage); })[0];
+    pill.textContent = "失败" + (failedStage ? " · " + failedStage.name : "");
+    pill.classList.add("is-failed");
+    if (pipeline.failure_reason || pipeline.failureReason) pill.title = pipeline.failure_reason || pipeline.failureReason;
     return;
   }
 
   if (pipeline.status === "completed") {
-    elements.pipelineStatus.textContent = "已完成";
-    elements.pipelineStatus.classList.add("is-done");
+    pill.textContent = "已完成";
+    pill.classList.add("is-done");
     return;
   }
 
   if (pipeline.status === "waiting_review") {
-    elements.pipelineStatus.textContent = "等待你确认";
-    elements.pipelineStatus.classList.add("is-review");
+    pill.textContent = "等待你确认";
+    pill.classList.add("is-review");
     return;
   }
 
-  elements.pipelineStatus.textContent = "可继续运行";
-  elements.pipelineStatus.classList.add("is-running");
+  // ready：空闲就绪，不加任何运行中脉冲
+  var next = getCurrentStage();
+  pill.textContent = next ? "就绪 · 下一步：" + next.name : "就绪";
 }
 
 // ── Live output panel ──
+// 流式进行中只在终端显示；完成后终端收起为一行摘要，产物面板展示最终产物。
+// 打回时不清空，而是把上一轮输出折叠归档。
 
 function showLiveOutput() {
   elements.liveOutputEmpty.classList.add("hidden");
@@ -194,24 +219,62 @@ function showLiveOutput() {
 
 function hideLiveOutput() {
   clearLiveOutput();
+  clearLiveArchives();
+  elements.liveOutputSummary.classList.add("hidden");
 }
 
 function clearLiveOutput() {
-  // Remove dynamically-added children but keep liveOutputEmpty in the DOM
+  // Remove dynamically-added children but keep liveOutputEmpty and
+  // archived previous rounds (.live-archive) in the DOM.
   var children = elements.liveOutputStream.children;
   for (var i = children.length - 1; i >= 0; i--) {
-    if (children[i].id !== "liveOutputEmpty") {
+    if (children[i].id !== "liveOutputEmpty" && !children[i].classList.contains("live-archive")) {
       children[i].remove();
     }
   }
   elements.liveOutputEmpty.classList.remove("hidden");
   elements.liveOutputTitle.textContent = "AI 正在工作…";
   elements.liveOutputStage.textContent = "等待中";
+  liveLineCount = 0;
+}
+
+function clearLiveArchives() {
+  elements.liveOutputStream.querySelectorAll(".live-archive").forEach(function (el) { el.remove(); });
+}
+
+function collapseLiveOutput() {
+  if (liveLineCount <= 0) return;
+  elements.liveOutputStream.classList.add("hidden");
+  elements.liveOutputSummaryText.textContent = "已完成 · " + liveLineCount + " 行输出";
+  elements.liveOutputSummary.classList.remove("hidden");
+}
+
+function expandLiveOutput() {
+  elements.liveOutputStream.classList.remove("hidden");
+  elements.liveOutputSummary.classList.add("hidden");
+}
+
+function archiveLiveOutput() {
+  var stream = elements.liveOutputStream;
+  var nodes = Array.prototype.slice.call(stream.children).filter(function (el) {
+    return el.id !== "liveOutputEmpty" && !el.classList.contains("live-archive");
+  });
+  if (nodes.length === 0) return;
+  var details = document.createElement("details");
+  details.className = "live-archive";
+  var summary = document.createElement("summary");
+  summary.textContent = "上一轮输出 · " + liveLineCount + " 行（已打回）";
+  details.appendChild(summary);
+  nodes.forEach(function (n) { details.appendChild(n); });
+  stream.appendChild(details);
+  liveLineCount = 0;
+  elements.liveOutputSummary.classList.add("hidden");
 }
 
 function appendLiveChunk(text) {
   showLiveOutput();
   elements.liveOutputEmpty.classList.add("hidden");
+  liveLineCount += String(text).split("\n").length;
   var span = document.createElement("span");
   span.className = "stream-chunk";
   span.textContent = text;
@@ -222,6 +285,7 @@ function appendLiveChunk(text) {
 function appendSystemMessage(text) {
   showLiveOutput();
   elements.liveOutputEmpty.classList.add("hidden");
+  liveLineCount += 1;
   var div = document.createElement("div");
   div.className = "stream-system";
   div.textContent = "⚙ " + text;
@@ -232,6 +296,7 @@ function appendSystemMessage(text) {
 function appendErrorMessage(text) {
   showLiveOutput();
   elements.liveOutputEmpty.classList.add("hidden");
+  liveLineCount += 1;
   var div = document.createElement("div");
   div.className = "stream-error";
   div.textContent = "✕ " + text;
@@ -328,6 +393,8 @@ function disconnectLiveOutput() {
 function connectLiveOutput(pipelineId) {
   disconnectLiveOutput();
   clearLiveOutput();
+  elements.liveOutputSummary.classList.add("hidden");
+  elements.liveOutputStream.classList.remove("hidden");
   showLiveOutput();
 
   return new Promise(function (resolve, reject) {
@@ -346,6 +413,11 @@ function connectLiveOutput(pipelineId) {
 
       liveOutputEventSource.addEventListener("stage", function (event) {
         setLiveOutputStage(event.data);
+      });
+
+      // 后端定期发送的心跳：只记录到达时间，不打扰界面。
+      liveOutputEventSource.addEventListener("heartbeat", function () {
+        lastHeartbeatAt = Date.now();
       });
 
       liveOutputEventSource.addEventListener("stats", function (event) {
@@ -396,25 +468,17 @@ function connectLiveOutput(pipelineId) {
 
 function renderStages() {
   var completedIds = getCompletedStageIds();
-  var currentId = pipeline ? pipeline.currentStageId : STAGES[0].id;
-  var isCompleted = pipeline && pipeline.status === "completed";
-  var stateLabels = { complete: "已完成", current: "进行中", pending: "待处理" };
+  var labels = core.STAGE_STATE_LABELS;
+  var waitingCount = 0;
 
   elements.stageList.innerHTML = getStages().map(function (stage, index) {
-    var state = completedIds.has(stage.id)
-      ? "complete"
-      : stage.id === currentId
-        ? "current"
-        : "pending";
-    var stateLabel = stateLabels[state];
-
-    if (isCompleted && completedIds.has(stage.id)) {
-      state = "complete";
-      stateLabel = "已完成";
-    }
+    var state = core.resolveStageState(stage.id, pipeline);
+    if (state === "waiting_review") waitingCount += 1;
+    var stateLabel = labels[state];
 
     return (
       '<li class="stage-card is-' + state + '" data-stage-id="' + stage.id + '">' +
+        '<span class="card-alert">需审批</span>' +
         '<span class="card-num">' + (index + 1) + "</span>" +
         '<span class="card-name">' + stage.name + "</span>" +
         '<span class="card-agent">' + stage.agent + "</span>" +
@@ -425,8 +489,29 @@ function renderStages() {
 
   elements.stageCount.textContent = completedIds.size + " / " + getStages().length;
 
-  // Click-to-scroll for completed stages
-  elements.stageList.querySelectorAll(".stage-card.is-complete").forEach(function (card) {
+  // 待审批数量徽章：有待审批时才出现
+  if (waitingCount > 0) {
+    elements.reviewCountBadge.textContent = waitingCount + " 个待审批";
+    elements.reviewCountBadge.classList.remove("hidden");
+  } else {
+    elements.reviewCountBadge.classList.add("hidden");
+  }
+
+  // 失败横幅：写明哪个阶段、为什么失败
+  if (pipeline && pipeline.status === "failed") {
+    var failedStage = getStages().filter(function (s) { return s.id === (pipeline.failed_stage || pipeline.failedStage); })[0];
+    var failedName = failedStage ? failedStage.name : "某阶段";
+    elements.failureBanner.innerHTML =
+      "<strong>✕ " + artifactRenderer.escapeHtml(failedName) + " 失败</strong>" +
+      ((pipeline.failure_reason || pipeline.failureReason) ? " — " + artifactRenderer.escapeHtml(pipeline.failure_reason || pipeline.failureReason) : " — 请重试或新建运行");
+    elements.failureBanner.classList.remove("hidden");
+  } else {
+    elements.failureBanner.classList.add("hidden");
+    elements.failureBanner.textContent = "";
+  }
+
+  // Click-to-scroll for completed and waiting-review stages
+  elements.stageList.querySelectorAll(".stage-card.is-complete, .stage-card.is-waiting_review").forEach(function (card) {
     card.addEventListener("click", function () {
       var stageId = card.dataset.stageId;
       var target = document.querySelector("#artifact-" + stageId);
@@ -439,11 +524,61 @@ function renderStages() {
           if (bar) bar.click();
         }
         // Brief highlight
-        target.style.boxShadow = "0 0 0 3px rgba(74,159,216,0.4)";
+        target.style.boxShadow = "0 0 0 3px rgba(184,241,53,0.35)";
         setTimeout(function () { target.style.boxShadow = ""; }, 1500);
       }
     });
   });
+}
+
+function buildArtifactSummaryHtml(stageId, artifact) {
+  var summary = core.extractArtifactSummary(artifact.content || "");
+  var files = summary.files.slice();
+  (artifact.changedFiles || []).forEach(function (f) {
+    if (files.indexOf(f) === -1) files.push(f);
+  });
+
+  var html = '<div class="artifact-summary">';
+
+  if (summary.points.length > 0) {
+    html += '<ul class="summary-points">' + summary.points.map(function (p) {
+      return "<li>" + artifactRenderer.escapeHtml(p) + "</li>";
+    }).join("") + "</ul>";
+  } else {
+    html += '<p class="summary-empty-note">暂无摘要，展开查看全文。</p>';
+  }
+
+  if (files.length > 0) {
+    html += '<div class="summary-row"><span class="summary-row__label">改动文件</span>' +
+      files.map(function (f) {
+        return '<span class="summary-chip">' + artifactRenderer.escapeHtml(f) + "</span>";
+      }).join("") + "</div>";
+  }
+
+  if (summary.risks.length > 0) {
+    html += '<div class="summary-row"><span class="summary-row__label">风险</span>' +
+      summary.risks.map(function (r) {
+        return '<span class="summary-chip summary-chip--risk">' + artifactRenderer.escapeHtml(r) + "</span>";
+      }).join("") + "</div>";
+  }
+
+  html += "</div>";
+  return html;
+}
+
+function buildVerdictCardHtml(artifact) {
+  var verdict = core.parseReviewVerdict(artifact.content || "");
+  if (!verdict) return "";
+  var isPass = verdict.verdict === "pass";
+  var html = '<div class="verdict-card ' + (isPass ? "verdict-pass" : "verdict-reject") + '">' +
+    "<strong>" + (isPass ? "✓ 评审结论：通过" : "✕ 评审结论：驳回") + "</strong>";
+  if (verdict.issues.length > 0) {
+    html += "<ul>" + verdict.issues.map(function (issue) {
+      return "<li>" + artifactRenderer.escapeHtml(issue) + "</li>";
+    }).join("") + "</ul>";
+  }
+  html += "</div>";
+  return html;
 }
 
 function renderArtifact() {
@@ -491,11 +626,16 @@ function renderArtifact() {
     var artifact = pipeline.artifacts[stageId];
     var existing = existingSections[stageId];
     var section = existing || document.createElement("section");
-    section.className = "artifact-section";
+    var state = core.resolveStageState(stageId, pipeline);
+    section.className = "artifact-section is-" + state;
     section.id = "artifact-" + stageId;
     section.dataset.stageId = stageId;
 
-    var isCollapsed = section.dataset.collapsed === "true";
+    // 全文默认折叠，只把当前待审批的那一段展开；用户手动折叠/展开过则保留他的选择。
+    var isCurrentWaiting = state === "waiting_review";
+    var isCollapsed = userToggledSections[stageId]
+      ? section.dataset.collapsed === "true"
+      : !isCurrentWaiting;
     var time = new Date(artifact.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
     var tagClass = tagClassMap[stageId] || "";
@@ -507,10 +647,13 @@ function renderArtifact() {
         '<span class="artifact-section-time">' + time + '</span>' +
         '<button class="artifact-section-toggle" type="button">' + (isCollapsed ? "▸" : "▾") + '</button>' +
       '</div>' +
+      buildVerdictCardHtml(artifact) +
+      buildArtifactSummaryHtml(stageId, artifact) +
       '<div class="artifact-section-body' + (isCollapsed ? " collapsed" : "") + '">' +
         '<div class="markdown-document">' + artifactRenderer.renderMarkdown(artifact.content) + '</div>' +
         '<div class="section-extras" id="extras-' + stageId + '"></div>' +
       '</div>';
+    section.dataset.collapsed = isCollapsed ? "true" : "false";
 
     if (!existing) {
       elements.artifactSections.appendChild(section);
@@ -529,6 +672,7 @@ function renderArtifact() {
         body.classList.toggle("collapsed");
         toggleBtn.textContent = isNowCollapsed ? "▸" : "▾";
         s.dataset.collapsed = isNowCollapsed ? "true" : "false";
+        userToggledSections[sid] = true;
       };
     }(section, stageId));
 
@@ -847,16 +991,45 @@ function renderProductPreviewInCodeStage() {
   });
 }
 
-function renderReview() {
+// ── 审批置顶条 + 审批历史时间线 ──
+
+function renderApprovalBar() {
   var stage = getCurrentStage();
   var isWaitingReview = pipeline && pipeline.status === "waiting_review";
 
-  elements.reviewState.textContent = isWaitingReview ? (stage ? stage.name + " 待确认" : "") : "暂时不用确认";
-  elements.reviewEmpty.classList.toggle("hidden", isWaitingReview);
-  elements.reviewControls.classList.toggle("hidden", !isWaitingReview);
+  elements.approvalBar.classList.toggle("hidden", !isWaitingReview);
+  elements.approvalStageName.textContent = isWaitingReview && stage ? stage.name : "";
   elements.rejectReason.disabled = !isWaitingReview;
   elements.approveButton.disabled = !isWaitingReview;
   elements.rejectButton.disabled = !isWaitingReview;
+
+  elements.reviewPanel.classList.toggle("is-waiting", !!isWaitingReview);
+  elements.reviewState.textContent = isWaitingReview
+    ? (stage ? stage.name + " 待确认" : "待确认")
+    : "暂无待确认";
+}
+
+function renderReviewHistory() {
+  var history = (pipeline && pipeline.reviewHistory) || [];
+
+  elements.reviewHistoryEmpty.classList.toggle("hidden", history.length > 0);
+  elements.reviewHistoryList.innerHTML = history.slice().reverse().map(function (record) {
+    var isApprove = record.decision === "approve";
+    var time = "";
+    try {
+      time = new Date(record.createdAt).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+    } catch (_) {}
+    return (
+      '<li class="review-history-item">' +
+        '<span class="review-history-item__icon ' + (isApprove ? "approve" : "reject") + '">' + (isApprove ? "✓" : "✕") + "</span>" +
+        '<div class="review-history-item__body">' +
+          "<strong>" + artifactRenderer.escapeHtml(record.stageName || "") + " · " + (isApprove ? "通过" : "打回") + "</strong>" +
+          (record.reason ? '<div class="review-history-item__reason">' + artifactRenderer.escapeHtml(record.reason) + "</div>" : "") +
+        "</div>" +
+        '<span class="review-history-item__time">' + time + "</span>" +
+      "</li>"
+    );
+  }).join("");
 }
 
 // Show product preview as soon as code is generated (BEFORE delivery stage)
@@ -875,7 +1048,8 @@ function renderProductPreview() {
   elements.productPreviewLink.classList.toggle("is-disabled", !previewUrl);
 }
 
-// Show delivery summary only when pipeline is fully completed
+// Show delivery summary only when pipeline is fully completed.
+// 展示 delivery 阶段真正的总结内容（产物正文）+ diff 统计 + 文件清单。
 function renderDeliveryPackage() {
   var isComplete = pipeline && pipeline.status === "completed";
   elements.deliveryPackage.classList.toggle("hidden", !isComplete);
@@ -885,27 +1059,28 @@ function renderDeliveryPackage() {
   var delivery = getArtifact("delivery");
   var code = getArtifact("code");
   var test = getArtifact("test");
-  var review = getArtifact("review");
 
-  elements.deliverySummaryTitle.textContent = pipeline.requirement;
-  elements.deliverySummaryText.textContent = delivery
-    ? "最终交付物已生成，包含代码变更、测试文件和交付总结。"
-    : "产品已经生成，交付说明暂未生成。";
-  elements.deliveryValidationTitle.textContent = test ? "已生成测试文件" : "等待测试产物";
-  elements.deliveryValidationText.textContent = test
-    ? "可在运行副本中执行测试验证代码改动。"
-    : "等待测试阶段完成后会显示验证方式。";
-  if (review && review.content) {
-    elements.deliveryValidationText.textContent += " 已生成评审结论。";
-  }
+  elements.deliverySummaryBody.innerHTML = delivery && delivery.content
+    ? artifactRenderer.renderMarkdown(delivery.content)
+    : "<p>交付总结暂未生成。</p>";
 
   var changedFiles = [];
   if (code && code.changedFiles) changedFiles = changedFiles.concat(code.changedFiles);
   if (test && test.changedFiles) changedFiles = changedFiles.concat(test.changedFiles);
+  var uniqueFiles = [];
+  changedFiles.forEach(function (f) {
+    if (uniqueFiles.indexOf(f) === -1) uniqueFiles.push(f);
+  });
+  var testFiles = (test && test.changedFiles ? test.changedFiles.length : 0);
+
+  elements.deliveryStats.innerHTML =
+    '<div class="delivery-stat"><span>变更文件</span><strong>' + uniqueFiles.length + '</strong></div>' +
+    '<div class="delivery-stat"><span>其中测试文件</span><strong>' + testFiles + '</strong></div>' +
+    '<div class="delivery-stat"><span>完成阶段</span><strong>' + Object.keys(pipeline.artifacts).length + " / " + getStages().length + '</strong></div>';
 
   elements.deliveryFiles.replaceChildren.apply(
     elements.deliveryFiles,
-    changedFiles.map(function (file) {
+    uniqueFiles.map(function (file) {
       var item = document.createElement("li");
       item.textContent = file;
       return item;
@@ -1037,7 +1212,8 @@ function render() {
   setStatusBadge();
   renderStages();
   renderArtifact();
-  renderReview();
+  renderApprovalBar();
+  renderReviewHistory();
   renderWorkspace();
   renderProductPreview();
   renderDeliveryPackage();
@@ -1067,9 +1243,14 @@ async function runUntilReviewOrComplete() {
     await connectLiveOutput(pipeline.id);
     pipeline = await client.getPipeline(pipeline.id);
   } catch (error) {
-    runErrorMessage = error.message || "执行失败";
+    // 同一 pipeline 已在运行时，后端返回 409：如实告诉用户，而不是笼统报错。
+    if (error && error.status === 409) {
+      runErrorMessage = "该流程已在运行中（409），请等它结束后再试";
+    } else {
+      runErrorMessage = error.message || "执行失败";
+    }
     if (error.message) {
-      appendErrorMessage(error.message);
+      appendErrorMessage(runErrorMessage);
     }
   } finally {
     isRunning = false;
@@ -1077,18 +1258,115 @@ async function runUntilReviewOrComplete() {
     runningStageName = "";
     disconnectLiveOutput();
     render();
+    // 这一轮跑完了：终端收起为一行摘要，产物面板展示最终产物。
+    if (!runErrorMessage) collapseLiveOutput();
   }
 }
 
+// ── 历史运行：刷新恢复 + 列表切换 ──
+
+async function restoreLastPipeline() {
+  var id = loadLastPipelineId();
+  if (!id) return false;
+  try {
+    var restored = await client.getPipeline(id);
+    if (restored && restored.id) {
+      pipeline = restored;
+      render();
+      return true;
+    }
+  } catch (_) {
+    // 后端不可用或该运行已被删除：静默降级，不报错、不挡页面。
+  }
+  return false;
+}
+
+function formatHistoryStatus(status) {
+  var map = {
+    ready: "就绪",
+    running: "运行中",
+    waiting_review: "待审批",
+    failed: "失败",
+    completed: "已完成",
+  };
+  return map[status] || status || "未知";
+}
+
+async function loadHistoryList() {
+  elements.historyList.innerHTML = '<div class="history-loading">加载中…</div>';
+  try {
+    var list = await client.listPipelines();
+    if (!Array.isArray(list) || list.length === 0) {
+      elements.historyList.innerHTML = '<div class="history-empty">暂无历史运行</div>';
+      return;
+    }
+    elements.historyList.innerHTML = "";
+    list.forEach(function (item) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "history-item";
+      var name = (item.name || item.requirement || item.id || "").trim();
+      if (name.length > 28) name = name.slice(0, 28) + "…";
+      var updated = "";
+      try {
+        updated = item.updated_at ? new Date(item.updated_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "";
+      } catch (_) {}
+      var stageName = "";
+      if (item.current_stage) {
+        var found = STAGES.filter(function (s) { return s.id === item.current_stage; })[0];
+        stageName = found ? found.name : item.current_stage;
+      }
+      button.innerHTML =
+        '<span class="history-item__name">' + artifactRenderer.escapeHtml(name) + "</span>" +
+        '<span class="history-item__meta">' +
+          '<span class="history-item__status st-' + artifactRenderer.escapeHtml(item.status || "") + '">' + formatHistoryStatus(item.status) + "</span>" +
+          (stageName ? "<span>" + artifactRenderer.escapeHtml(stageName) + "</span>" : "") +
+          (updated ? "<span>" + updated + "</span>" : "") +
+        "</span>";
+      button.addEventListener("click", function () {
+        loadPipelineById(item.id);
+      });
+      elements.historyList.appendChild(button);
+    });
+  } catch (_) {
+    // GET /pipelines 暂不可用（旧后端 / 演示回放）：优雅降级，只恢复本地 id。
+    elements.historyList.innerHTML = '<div class="history-empty">历史记录暂不可用（需要后端支持 GET /pipelines）</div>';
+  }
+}
+
+async function loadPipelineById(id) {
+  try {
+    var restored = await client.getPipeline(id);
+    if (restored && restored.id) {
+      pipeline = restored;
+      saveLastPipelineId(id);
+      userToggledSections = {};
+      clearLiveArchives();
+      closeHistoryPanel();
+      render();
+    }
+  } catch (error) {
+    runErrorMessage = error.message || "加载失败";
+    render();
+  }
+}
+
+function openHistoryPanel() {
+  elements.historyPanel.classList.remove("hidden");
+  loadHistoryList();
+}
+
+function closeHistoryPanel() {
+  elements.historyPanel.classList.add("hidden");
+}
+
 function openClarificationModal(requirement) {
-  console.log("[openClarificationModal] opening for requirement:", requirement ? requirement.substring(0, 60) : "(empty)");
   pendingRequirement = requirement;
   pendingTemplate = elements.templateSelector ? elements.templateSelector.value : "feature";
   clarificationStepIndex = 0;
   clarificationAnswers = {};
   elements.clarificationRequirement.textContent = requirement;
   elements.clarificationModal.classList.remove("hidden");
-  console.log("[openClarificationModal] modal shown, calling renderClarificationStep");
   renderClarificationStep();
 }
 
@@ -1109,18 +1387,24 @@ function renderClarificationDots() {
 }
 
 function renderClarificationStep() {
-  console.log("[renderClarificationStep] stepIndex=", clarificationStepIndex);
   var questions = clarificationFlow.getClarificationQuestions(pendingRequirement);
   var total = questions.length;
   var question = questions[clarificationStepIndex];
-  console.log("[renderClarificationStep] question:", question.label);
 
   elements.clarificationProgress.textContent = (clarificationStepIndex + 1) + " / " + total;
   elements.clarificationStepLabel.textContent = question.label;
   elements.clarificationStepQuestion.textContent = question.question;
-  elements.clarificationStepHint.textContent = "推荐：" + question.recommended;
   elements.clarificationStepAnswer.placeholder = question.placeholder;
   elements.clarificationStepAnswer.value = clarificationAnswers[question.id] || "";
+
+  // 动态问题没有放之四海皆准的推荐答案：没有 recommended 就隐藏该按钮。
+  if (question.recommended) {
+    elements.clarificationStepHint.textContent = "推荐：" + question.recommended;
+    elements.clarificationRecommend.classList.remove("hidden");
+  } else {
+    elements.clarificationStepHint.textContent = "想到什么写什么，也可以留空。";
+    elements.clarificationRecommend.classList.add("hidden");
+  }
 
   var isLast = clarificationStepIndex === total - 1;
   var isFirst = clarificationStepIndex === 0;
@@ -1134,7 +1418,6 @@ function renderClarificationStep() {
 
   renderClarificationDots();
   elements.clarificationStepAnswer.focus();
-  console.log("[renderClarificationStep] done, button text:", elements.clarificationNext.textContent);
 }
 
 function collectClarificationAnswers() {
@@ -1142,7 +1425,6 @@ function collectClarificationAnswers() {
 }
 
 async function startPipeline(requirement, projectPath, template) {
-  console.log("[startPipeline] called, requirement length:", requirement ? requirement.length : 0);
   runErrorMessage = "";
   abortController = new AbortController();
   isRunning = true;
@@ -1154,11 +1436,11 @@ async function startPipeline(requirement, projectPath, template) {
   }
 
   try {
-    console.log("[startPipeline] POST /pipelines with requirement:", requirement ? requirement.substring(0, 80) : "");
     pipeline = await client.createPipeline(requirement, projectPath, template);
-    console.log("[startPipeline] pipeline created:", pipeline.id);
+    saveLastPipelineId(pipeline.id);
+    userToggledSections = {};
+    clearLiveArchives();
   } catch (error) {
-    console.error("[startPipeline] createPipeline failed:", error.message);
     runErrorMessage = error.message;
     isRunning = false;
     abortController = null;
@@ -1171,7 +1453,6 @@ async function startPipeline(requirement, projectPath, template) {
   abortController = null;
   runningStageName = "";
   elements.rejectReason.value = "";
-  console.log("[startPipeline] calling runUntilReviewOrComplete...");
   await runUntilReviewOrComplete();
 }
 
@@ -1192,7 +1473,6 @@ elements.form.addEventListener("submit", async function (event) {
   await startPipeline(requirement, "", template);
 });
 
-
 async function approveCurrentStage() {
   if (!pipeline) return;
   try {
@@ -1212,7 +1492,8 @@ async function rejectCurrentStage(reasonElement) {
   try {
     pipeline = await client.submitReview(pipeline.id, "reject", reasonElement.value);
     elements.rejectReason.value = "";
-    clearLiveOutput();
+    // 打回后不清空实时输出：上一轮输出折叠归档，留着备查。
+    archiveLiveOutput();
     render();
     await runUntilReviewOrComplete();
   } catch (error) {
@@ -1225,14 +1506,42 @@ elements.rejectButton.addEventListener("click", function () {
   rejectCurrentStage(elements.rejectReason);
 });
 
+elements.liveOutputExpandBtn.addEventListener("click", expandLiveOutput);
+
+elements.historyButton.addEventListener("click", function () {
+  if (elements.historyPanel.classList.contains("hidden")) {
+    openHistoryPanel();
+  } else {
+    closeHistoryPanel();
+  }
+});
+
+elements.historyClose.addEventListener("click", closeHistoryPanel);
+
+document.addEventListener("click", function (event) {
+  if (elements.historyPanel.classList.contains("hidden")) return;
+  if (elements.historyPanel.contains(event.target)) return;
+  if (elements.historyButton.contains(event.target)) return;
+  closeHistoryPanel();
+});
+
 elements.clarificationCancel.addEventListener("click", function () {
   pendingRequirement = "";
   closeClarificationModal();
 });
 
+// 跳过澄清：直接用原始需求生成，不往 PRD 里掺任何模板答案。
+elements.clarificationSkip.addEventListener("click", function () {
+  var requirement = pendingRequirement;
+  var template = pendingTemplate;
+  closeClarificationModal();
+  startPipeline(requirement, "", template);
+});
+
 elements.clarificationRecommend.addEventListener("click", function () {
   var questions = clarificationFlow.getClarificationQuestions(pendingRequirement);
   var question = questions[clarificationStepIndex];
+  if (!question.recommended) return;
   elements.clarificationStepAnswer.value = question.recommended;
   clarificationAnswers[question.id] = question.recommended;
 });
@@ -1267,10 +1576,8 @@ elements.clarificationStepAnswer.addEventListener("keydown", function (event) {
 });
 
 function submitClarification() {
-  console.log("[submitClarification] called, stepIndex=", clarificationStepIndex);
   var questions = clarificationFlow.getClarificationQuestions(pendingRequirement);
   var total = questions.length;
-  console.log("[submitClarification] total questions=", total);
 
   // Save current step answer
   var question = questions[clarificationStepIndex];
@@ -1280,26 +1587,17 @@ function submitClarification() {
   // If not on last step, advance
   if (clarificationStepIndex < total - 1) {
     clarificationStepIndex += 1;
-    console.log("[submitClarification] advancing to step", clarificationStepIndex);
     renderClarificationStep();
     return;
   }
 
-  // Final step: submit with all answers
-  console.log("[submitClarification] final step, submitting...");
-  questions.forEach(function (q) {
-    if (!clarificationAnswers[q.id]) {
-      clarificationAnswers[q.id] = q.recommended;
-    }
-  });
-
+  // Final step: 只合并用户真正答了的内容；一道没答就直接用原始需求，
+  // 不再用推荐答案自动填空。
   var enrichedRequirement = clarificationFlow.mergeClarificationAnswers(
     pendingRequirement,
     clarificationAnswers
   );
-  console.log("[submitClarification] merged requirement length:", enrichedRequirement.length);
   closeClarificationModal();
-  console.log("[submitClarification] calling startPipeline...");
   startPipeline(enrichedRequirement, "", pendingTemplate);
 }
 
@@ -1340,15 +1638,6 @@ function collapsePreview() {
 document.addEventListener("keydown", function (event) {
   if (event.key === "Escape" && expandedFrameWrap) {
     collapsePreview();
-  }
-});
-
-elements.prototypeExpandBtn.addEventListener("click", function () {
-  if (expandedFrameWrap === elements.prototypeFrameWrap) {
-    collapsePreview();
-  } else {
-    collapsePreview();
-    expandPreview(elements.prototypeFrameWrap);
   }
 });
 
@@ -1421,6 +1710,8 @@ elements.resetButton.addEventListener("click", function () {
   pipeline = null;
   runErrorMessage = "";
   pendingRequirement = "";
+  userToggledSections = {};
+  clearLastPipelineId();
   disconnectLiveOutput();
   hideLiveOutput();
   if (abortController) {
@@ -1431,8 +1722,9 @@ elements.resetButton.addEventListener("click", function () {
   render();
 });
 
-// On load, show initial state and check backend health
+// On load, show initial state, restore the last pipeline if any, and check backend health
 render();
+restoreLastPipeline();
 
 // Validate all critical element references
 (function validateElements() {
