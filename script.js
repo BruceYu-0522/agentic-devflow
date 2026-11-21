@@ -49,7 +49,6 @@ var elements = {
   pipelineStatus: document.querySelector("#pipelineStatus"),
   stageCount: document.querySelector("#stageCount"),
   stageList: document.querySelector("#stageList"),
-  reviewCountBadge: document.querySelector("#reviewCountBadge"),
   failureBanner: document.querySelector("#failureBanner"),
   // Live output
   liveOutput: document.querySelector("#liveOutput"),
@@ -469,11 +468,9 @@ function connectLiveOutput(pipelineId) {
 function renderStages() {
   var completedIds = getCompletedStageIds();
   var labels = core.STAGE_STATE_LABELS;
-  var waitingCount = 0;
 
   elements.stageList.innerHTML = getStages().map(function (stage, index) {
     var state = core.resolveStageState(stage.id, pipeline);
-    if (state === "waiting_review") waitingCount += 1;
     var stateLabel = labels[state];
 
     return (
@@ -481,21 +478,12 @@ function renderStages() {
         '<span class="card-alert">需审批</span>' +
         '<span class="card-num">' + (index + 1) + "</span>" +
         '<span class="card-name">' + stage.name + "</span>" +
-        '<span class="card-agent">' + stage.agent + "</span>" +
         '<span class="card-state">' + stateLabel + "</span>" +
       "</li>"
     );
   }).join("");
 
   elements.stageCount.textContent = completedIds.size + " / " + getStages().length;
-
-  // 待审批数量徽章：有待审批时才出现
-  if (waitingCount > 0) {
-    elements.reviewCountBadge.textContent = waitingCount + " 个待审批";
-    elements.reviewCountBadge.classList.remove("hidden");
-  } else {
-    elements.reviewCountBadge.classList.add("hidden");
-  }
 
   // 失败横幅：写明哪个阶段、为什么失败
   if (pipeline && pipeline.status === "failed") {
@@ -636,15 +624,11 @@ function renderArtifact() {
     var isCollapsed = userToggledSections[stageId]
       ? section.dataset.collapsed === "true"
       : !isCurrentWaiting;
-    var time = new Date(artifact.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-
     var tagClass = tagClassMap[stageId] || "";
 
     section.innerHTML =
       '<div class="artifact-section-bar">' +
         '<span class="stage-tag ' + tagClass + '">' + artifact.stageName + '</span>' +
-        '<span class="artifact-section-agent">' + artifactRenderer.escapeHtml(artifact.model || "") + '</span>' +
-        '<span class="artifact-section-time">' + time + '</span>' +
         '<button class="artifact-section-toggle" type="button">' + (isCollapsed ? "▸" : "▾") + '</button>' +
       '</div>' +
       buildVerdictCardHtml(artifact) +
@@ -794,12 +778,15 @@ function renderVisualPlan(visualPlan) {
 function syntaxHighlightCode(code, ext) {
   var escaped = artifactRenderer.escapeHtml(code);
   if (ext === "js" || ext === "ts" || ext === "jsx" || ext === "tsx") {
+    // 顺序很关键：先做关键字/数字（纯文本上替换），再做注释，最后做字符串。
+    // 字符串、注释的 <span> 标签里含有 class 等词，若关键字替换跑在后面，
+    // 会命中标签本身、把高亮 HTML 撕碎、原样显示出来。
     escaped = escaped
-      .replace(/(\/\/.*)/g, '<span class="code-comment">$1</span>')
-      .replace(/(&quot;[^&]*&quot;|&#39;[^&#39;]*&#39;|`[^`]*`)/g, '<span class="code-string">$1</span>')
       .replace(/\b(function|const|let|var|return|if|else|for|while|class|import|export|from|async|await|try|catch|throw|new|this|typeof|instanceof)\b/g, '<span class="code-keyword">$1</span>')
       .replace(/\b(true|false|null|undefined)\b/g, '<span class="code-keyword">$1</span>')
-      .replace(/(\d+)/g, '<span class="code-number">$1</span>');
+      .replace(/(\d+)/g, '<span class="code-number">$1</span>')
+      .replace(/(\/\/.*)/g, '<span class="code-comment">$1</span>')
+      .replace(/(&quot;[^&]*&quot;|&#39;[^&#39;]*&#39;|`[^`]*`)/g, '<span class="code-string">$1</span>');
   } else if (ext === "html") {
     escaped = escaped
       .replace(/(&lt;!--[\s\S]*?--&gt;)/g, '<span class="code-comment">$1</span>')
@@ -971,7 +958,6 @@ function renderProductPreviewInCodeStage() {
   wrapper.innerHTML =
     '<div class="visual-plan-header">' +
       '<strong>产品预览</strong>' +
-      '<p>当前生成的页面效果，不满意可在评审时打回修改</p>' +
       '<button class="ghost-button expand-preview-btn inline-expand-btn" type="button">全屏查看</button>' +
     '</div>' +
     '<div class="product-preview-frame">' +

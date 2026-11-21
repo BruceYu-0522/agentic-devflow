@@ -462,7 +462,7 @@
     if (card) {
       var note = document.createElement("div");
       note.className = "demo-note";
-      note.innerHTML = '<span class="demo-note__tag">在线演示</span><span>回放一次预先生成的示例运行：需求固定，每个阶段照样会停下来等你通过或打回。代码阶段产出的页面和测试文件都能真正运行。</span>';
+      note.innerHTML = '<span class="demo-note__tag">在线演示</span>';
       card.appendChild(note);
     }
     // ?autoplay=N：自动跑到第 N 个阶段的确认点（用于截图）
