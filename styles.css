@@ -608,6 +608,10 @@ a { color: inherit; }
   .stage-row { grid-template-columns: repeat(6, 92px); overflow-x: auto; padding-bottom: 6px; }
   .delivery-grid, .obs-cards { grid-template-columns: 1fr; }
   .brand small { display: none; }
+  /* 顶栏在窄屏换行，而不是把状态文字逐字竖排挤坏 */
+  .app-header { flex-wrap: wrap; }
+  .status-pill, .header-actions .ghost-button { white-space: nowrap; }
+  .header-actions .ghost-button { padding: 0 9px; }
   .approval-bar__actions { width: 100%; }
   .approval-bar__actions .approve-button, .approval-bar__actions .reject-button { flex: 1; }
 }
